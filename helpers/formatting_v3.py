@@ -245,22 +245,16 @@ def meta_table(ax, metadata: dict, title: str = 'Metadata', fontsize=12,
 
     # Estimate comment line count
     comment_lines = wrap_comment("\n".join(comments), max_chars=30).count('\n') + 1 if has_comments else 0
-
     # Estimate total content height including comments
-    line_count = sum(len(v) if isinstance(v, list) else 1 for v in metadata.values())
-    total_lines = line_count + comment_lines + 1  # +1 for padding/title
+    metadata_lines = sum(len(v) if isinstance(v, list) else 1 for v in metadata.values())
+    total_lines = metadata_lines + comment_lines + 1  # +1 for padding/title
 
-    line_spacing = 0.03
-    box_height = line_spacing * total_lines
-    max_box_height = 0.96 
-
+    box_height   = 0.96 
+    line_spacing = box_height / total_lines
     # Clamp to avoid overflow
-    box_height = min(box_height, max_box_height)
     patch_y = 0.5 - box_height / 2  # Center the box vertically
 
-
     # 1. Calculate layout
-    line_spacing = box_height / (len(metadata) + comment_lines)
     y_pos_start = 0.5 + box_height / 2 - line_spacing  # Top of the box
 
     # 2. Add the patch centered around content
@@ -288,7 +282,7 @@ def meta_table(ax, metadata: dict, title: str = 'Metadata', fontsize=12,
     # 4. Render content at correct y_pos
     key_width = 0.55  # percentage of horizontal space for keys
     value_start = 0.03 + key_width + 0.04  # left padding + key width + spacing
-    y_pos = y_pos_start + 0.04
+    y_pos = y_pos_start
     for k, v in metadata.items():
         val_lines = v if isinstance(v, list) else [str(v)]
         num_lines = len(val_lines)
@@ -304,7 +298,7 @@ def meta_table(ax, metadata: dict, title: str = 'Metadata', fontsize=12,
     if comments and comm_on:
         comment_text = wrap_comment("\n".join(comments), max_chars=30)
         ax.text(
-            0.02, patch_y - 0.00,
+            0.02, patch_y + 0.01,
             comment_text,
             fontsize=fontsize - 2,
             fontstyle='italic',
@@ -315,10 +309,72 @@ def meta_table(ax, metadata: dict, title: str = 'Metadata', fontsize=12,
             linespacing=1.3,
             wrap=True)
 
+
+
+
+def qfactor_table(ax, qf_data, title="Quality Factors", fontsize=12,
+                  facecolor='bisque', style=None):
+    ax.clear()
+    ax.axis('off')
+    # Layout parameters
+    box_height = 0.96
+    line_spacing = box_height / (len(qf_data) + 1)
+    patch_y = 0.5 - box_height / 2
+
+    # Background patch
+    rect = patches.FancyBboxPatch(
+        (0, patch_y), 1.1, box_height,
+        boxstyle="round,pad=0.02",
+        linewidth=style['tick_width'] if style else 3,
+        edgecolor="black",
+        facecolor=facecolor,
+        transform=ax.transAxes,
+        clip_on=False)
+    ax.add_patch(rect)
+
+    # Total content height
+    content_height = line_spacing * len(qf_data)
+    # Adjust to center the content block
+    y_pos = 0.5 + content_height / 2 
+    # Title
+    title_y = patch_y + box_height + 0.05
+    ax.text(0.5, title_y, title,
+            fontsize=fontsize + 4,
+            ha='center', va='bottom',
+            transform=ax.transAxes)
+
+    # Content rendering
+    key_x = 0.04
+    val_x = 0.62
+    for key, val in qf_data:
+        ax.text(key_x, y_pos, key, fontsize=fontsize,
+                fontfamily='monospace', ha='left', va='top',
+                transform=ax.transAxes)
+        ax.text(val_x, y_pos, val, fontsize=fontsize,
+                fontfamily='monospace', ha='left', va='top',
+                transform=ax.transAxes)
+        y_pos -= line_spacing
+
 def scale_to_ghz(val):
     if val > 1e6:  # Assume Hz
         return round(val / 1e9, 3)
     return round(val, 3)  # Already in GHz
+
+def format_val(val, unit="", precision=0, default="—"):
+    try:
+        if precision == 0:
+            return f"{int(round(val))} {unit}".strip()
+        return f"{round(val, precision)} {unit}".strip()
+    except (TypeError, ValueError):
+        return default
+
+
+def format_scaled(val, unit="GHz", default="—"):
+    try:
+        return f"{scale_to_ghz(val)} {unit}"
+    except (TypeError, ValueError):
+        return default
+
 
 ###########################################################################################
 ## Formatting the Plot ----------------------------------------------------------------- ##
@@ -539,10 +595,19 @@ def get_linecut(data_x, data_y, data_z, axis='x', value=None):
     elif axis == 'x':
         indx = np.abs(data_x - value).argmin()
         return data_y, data_z[:, indx]
-def plot_linecut(ax, x, y, xlabel, ylabel, filename=None, style=None):
+def plot_linecut(ax, x, y, xlabel, ylabel, filename=None, style=None, **plot_kwargs):
     ax.clear()
+    # Unpack style dict
+    base_style = {
+        'color': style['line_color'],
+        'linewidth': style['line_width'],
+        # You can add other defaults here if needed
+    }
+    # Give kwargs precedence over base_style
+    final_style = {**base_style, **plot_kwargs}
+
     # Plot the line
-    ax.plot(x, y, color=style['line_color'], linewidth=style['line_width'])
+    ax.plot(x, y, **final_style)
     # Axes labels
     ax.set_xlabel(xlabel, fontsize=style['fontsize'], labelpad=style['labelpad'])
     ax.set_ylabel(ylabel, fontsize=style['fontsize'], labelpad=style['labelpad'])
@@ -765,7 +830,8 @@ def fit_data(x, y, fit_type, artifact_indices=None, user_guess=None):
     return popt, pcov, model_func
 
 # Find quality factors using the inverse lorentzian
-def quality_fits(freq, power, data, artifact_indices=None, user_guess=None):
+def quality_fits(freq, power, data, artifact_indices=None, user_guess=None,
+                 x_window_min=None, x_window_max=None):
     # Initialize for quality factor sweep
     fit_type = 'lorz_inv'
     q_values = []
@@ -777,8 +843,17 @@ def quality_fits(freq, power, data, artifact_indices=None, user_guess=None):
     for i in range(data_z.shape[0]):
         # Take the i-th row of the data_z matrix
         trace = data_z[i, :]
+        # Apply x-windowing before fitting
+        if x_window_min is not None and x_window_max is not None:
+            mask = (data_x >= x_window_min) & (data_x <= x_window_max)
+            x_fit = data_x[mask]
+            z_fit = trace[mask]
+        else:
+            x_fit = data_x
+            z_fit = trace
+        # Fit the data
         try:
-            popt, _, _ = fit_data(data_x, trace, fit_type, artifact_indices,
+            popt, _, _ = fit_data(x_fit, z_fit, fit_type, artifact_indices,
                                    user_guess=user_guess)
             # Calculate the quality factor
             q = popt[1] / popt[2]
@@ -929,7 +1004,7 @@ def format_circle_data(freqs, real, imag, power,
 
 # Three panel plotting to show : circle fit, resonance curve, and metadata
 def triad_plot(freq, S21, settings, fig_dim = (10, 12), filename = None,
-                w_ratio = [2, 1], h_ratio = [1, 1], alpha=1):
+                w_ratio = [2, 1], h_ratio = [1, 1], alpha=1, c_adj=[0,0]):
     fig = plt.figure(figsize=fig_dim)
     gs = GridSpec(2, 2, width_ratios=w_ratio, height_ratios=h_ratio, figure=fig)
 
@@ -953,13 +1028,13 @@ def triad_plot(freq, S21, settings, fig_dim = (10, 12), filename = None,
     )
 
     # ax_iq plot formatting
-    center_re  = np.mean(S21.real)
-    center_im  = np.mean(S21.imag)
+    center_re  = np.mean(S21.real) + c_adj[0]
+    center_im  = np.mean(S21.imag) + c_adj[1]
     span_re    = np.max(S21.real) - np.min(S21.real)
     span_im    = np.max(S21.imag) - np.min(S21.imag)
     span_max   = max(span_re, span_im)
     # Add margin (e.g., 10%)
-    padding    = 0.1 * span_max
+    padding    = 0.2 * span_max
     half_width = 0.5 * span_max + padding
 
     # Raw IQ plot
@@ -977,12 +1052,12 @@ def triad_plot(freq, S21, settings, fig_dim = (10, 12), filename = None,
     ax_iq.set_ylim(center_im - half_width, center_im + half_width)
     ax_iq.tick_params(**tick_kwargs)
     ax_iq.set_aspect('equal')
-    ax_iq.plot(center_re, center_im, 'x', color='skyblue', markersize=8, zorder=3)
     for spine in ax_iq.spines.values():
         spine.set_linewidth(settings['tick_width'])
 
     # Resonance plot with GHz and dBm scaling
-    ax_res.plot(freq_GHz, S21_dBm, color=settings['line_color'], linewidth=settings['line_width'])
+    ax_res.plot(freq_GHz, S21_dBm, '.', color=settings['line_color'], 
+                markersize=settings['marker_size'], alpha=alpha)
     ax_res.set_xlabel("Frequency (GHz)", fontsize=settings['fontsize'], labelpad=settings['labelpad'])
     ax_res.set_ylabel("S21 (dBm)", fontsize=settings['fontsize'], labelpad=settings['labelpad'])
     ax_res.xaxis.set_major_locator(settings['x_locator'])
@@ -995,5 +1070,139 @@ def triad_plot(freq, S21, settings, fig_dim = (10, 12), filename = None,
 
 
 
+# Five panel plotting to show : circle fit, resonance curve, phase fit, metadata, and 
+# quality factors.
+def circle_plot(freq, S21, settings, fig_dim = (11, 16), filename = None,
+                w_ratio = [6.66, 4.33], h_ratio = [1.6, 1, 0.25, 0.75], alpha=1,
+                c_adj=[0,0], cf=None, scale=1, fit_color='darkorange',
+                p0_guess = [7, 4.5165, 0.005, -50]):
+    fig = plt.figure(figsize=fig_dim)
+    gs = GridSpec(4, 2, width_ratios=w_ratio, height_ratios=h_ratio, figure=fig)
 
+    # Axes setup using advanced layout
+    ax_iq    = fig.add_subplot(gs[  0, 0])
+    ax_res   = fig.add_subplot(gs[  1, 0])
+    ax_phase = fig.add_subplot(gs[2:4, 0])
 
+    ax_meta  = fig.add_subplot(gs[0:3, 1])
+    ax_qfact = fig.add_subplot(gs[3:4, 1])
+    ax_meta.axis('off')
+    ax_qfact.axis('off')
+
+    # Convert x-axis to GHz and y-axis to dBm
+    freq_GHz = freq / 1e9
+    S21_dBm = 20 * np.log10(np.abs(S21))
+    S21_ang = np.angle(S21)
+
+    # Tick and spine styling parameters
+    tick_kwargs = dict(
+        width=settings['tick_width'],
+        length=settings['tick_length'],
+        pad=settings['tick_pad'],
+        direction='in',
+        labelsize=settings['fontsize'])
+
+    # ax_iq plot formatting
+    center_re  = np.mean(S21.real) + c_adj[0]
+    center_im  = np.mean(S21.imag) + c_adj[1]
+    span_re    = np.max(S21.real) - np.min(S21.real)
+    span_im    = np.max(S21.imag) - np.min(S21.imag)
+    span_max   = max(span_re, span_im)
+    # Add margin (e.g., 10%)
+    padding    = 0.2 * span_max
+    half_width = 0.5 * span_max + padding
+
+    # IQ plot
+    ax_iq.plot(S21.real, S21.imag, '.', color=settings['line_color'], 
+               markersize=settings['marker_size'], alpha=alpha)
+    ax_iq.set_title(filename, fontsize=settings['title_fontsize']-3, pad=settings['title_pad'])
+    ax_iq.set_xlabel("Re(S21) arb. units", fontsize=settings['fontsize'], labelpad=settings['labelpad'])
+    ax_iq.set_ylabel("Im(S21) arb. units", fontsize=settings['fontsize'], labelpad=settings['labelpad'])
+    # Add faint x = 0 and y = 0 gridlines to circle plot
+    ax_iq.axhline(0, color='lightgray', linestyle='--', linewidth=2, zorder=0)
+    ax_iq.axvline(0, color='lightgray', linestyle='--', linewidth=2, zorder=0)
+    ax_iq.set_xlim(center_re - half_width, center_re + half_width)
+    ax_iq.set_ylim(center_im - half_width, center_im + half_width)
+    if center_re - half_width < 0 < center_re + half_width:
+        ax_iq.set_xticks([0])
+    else:
+        ax_iq.set_xticks([])
+    if center_im - half_width < 0 < center_im + half_width:
+        ax_iq.set_yticks([0])
+    else:
+        ax_iq.set_yticks([])
+    ax_iq.tick_params(**tick_kwargs)
+    ax_iq.set_aspect('equal')
+    for spine in ax_iq.spines.values():
+        spine.set_linewidth(settings['tick_width'])
+
+    # Resonance plot
+    ax_res.plot(freq_GHz, S21_dBm, '.', color=settings['line_color'], 
+                markersize=settings['marker_size'], alpha=alpha)
+    ax_res.set_ylabel("S21 (dBm)", fontsize=settings['fontsize'], labelpad=settings['labelpad'])
+    ax_res.xaxis.set_major_locator(settings['x_locator'])
+    ax_res.tick_params(**tick_kwargs)
+    for spine in ax_res.spines.values():
+        spine.set_linewidth(settings['tick_width'])
+    ax_res.yaxis.set_ticks(rounded_ticks(S21_dBm,step=2))
+    ax_res.set_ylim(rounded_ticks(S21_dBm,step=2)[0], rounded_ticks(S21_dBm,step=2)[-1])
+
+    # Phase plot
+    ax_phase.plot(freq_GHz, S21_ang, '.', color=settings['line_color'], 
+                markersize=settings['marker_size'], alpha=alpha)
+    ax_phase.set_xlabel("Frequency (GHz)", fontsize=settings['fontsize'], labelpad=settings['labelpad'])
+    ax_phase.set_ylabel("Phase (rad)", fontsize=settings['fontsize'], labelpad=settings['labelpad'])
+    ax_phase.xaxis.set_major_locator(settings['x_locator'])
+    ax_phase.tick_params(**tick_kwargs)
+    for spine in ax_phase.spines.values():
+        spine.set_linewidth(settings['tick_width'])
+
+    ax_phase.yaxis.set_ticks(rounded_ticks(S21_ang*10,step=2)/10)
+    ax_phase.set_ylim(rounded_ticks(S21_ang*10,step=2)[0]/10, rounded_ticks(S21_ang*10,step=2)[-1]/10)
+
+    # Add fit plot if circle fit data is provided
+    if cf:
+        ax_iq.plot(cf.z_data_sim.real, cf.z_data_sim.imag, 
+                   color=fit_color, lw=settings['line_width'])
+        ax_res.plot(freq_GHz, 20*np.log10(cf.z_data_sim_norm*scale), 
+                color=fit_color, lw=settings['line_width'])
+        ax_phase.plot(freq_GHz, np.angle(cf.z_data_sim_norm), 
+                color=fit_color, lw=settings['line_width'])
+      
+    # Use the Inv_Lor fit for finding a quality factor
+    dat   = np.abs(S21)
+    popt  = fit_data(freq_GHz, dat, 'lorz_inv', user_guess=p0_guess)[0]
+    q_li = popt[1] / popt[2] # Lorentzian inverse quality factor
+    q_lor_val = f"{q_li:.0f}" if 'q_li' in locals() and q_li is not None else "—"
+
+    # Quality factor metadata
+    qdat = [
+        ["f_res", format_scaled(cf.fitresults["fr"]) if cf else "—"],
+        ["Q_cf", format_val(cf.fitresults["Ql"], precision=0) if cf else "—"],
+        ["Q_lor", format_val(q_li, precision=0) if q_li is not None else "—"],
+        ["fwhm_cf", format_val(cf.fitresults["fr"]/cf.fitresults["Ql"]/1e6, "MHz", 3)
+            if cf and 'fr' in cf.fitresults and 'Ql' in cf.fitresults else "—"],
+        ["Qi_cf", format_val(cf.fitresults["Qi"], precision=0) if cf else "—"],
+        ["Qc_cf", format_val(cf.fitresults["Qc"], precision=0) if cf else "—"],
+    ]
+
+    return fig, (ax_iq, ax_res, ax_phase), ax_meta, ax_qfact, qdat
+
+# Table populating function for circle fit results (or lack thereof)
+def safe_cf_value(cf, key, fmt="{:.3f}", default="—"):
+    try:
+        val = cf.fitresults[key]
+        return fmt.format(val)
+    except (TypeError, AttributeError, KeyError):
+        return default
+    
+# Rounded ticks function for setting axis ticks of size 2
+def rounded_ticks(data, step=1):
+    """Round min down and max up, then return evenly spaced ticks."""
+    dmin, dmax = np.min(data), np.max(data)
+    lower = np.floor(dmin)
+    upper = np.ceil(dmax)
+    if upper-lower % step == 0:
+        lower -= 1
+    count = int( (upper - lower)/ step) + 1  # Inclusive range
+    return np.linspace(lower, upper, count)
