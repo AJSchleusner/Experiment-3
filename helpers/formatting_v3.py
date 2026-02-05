@@ -30,6 +30,7 @@ import os
 import re
 import math
 
+from typing import Tuple, Literal
 from datetime import date
 from newinstruments.BlueFors import BlueFors
 import matplotlib.pyplot as plt
@@ -95,56 +96,72 @@ def load_experiment_data(db_path: str):
     def grab(name):
         return db.grab_table(name) if name in available_tables else None
     # Access the info table to get metadata about the experiment
-    info = grab('table_info')
+    info = None
+    for name in ['metadata', 'general_metadata', 'table_info']:
+        temp = grab(name)
+        if temp is not None:
+            info = temp
+            break
 
     # Initialize an empty dictionary to hold metadata
     metadata = {}
-    # Extract the headers to set as metadata_col
-    for col in info.columns:
-        # Get the raw values from the column, dropping any NaN values
-        raw_vals = info[col].dropna().tolist()
-        # Handle frequency columns: convert to float, convert Hz → GHz
-        if "freq_range" in col.lower():
-            parsed_vals = [extract_freq_tuple(v) for v in raw_vals]
-            parsed_vals = [t for t in parsed_vals if t]  # remove failed parses
-            # Flatten each (start, stop) pair into two lines in order
-            formatted = []
-            for pair in parsed_vals:
-                formatted.extend([f"{scale_to_ghz(val)} GHz" for val in pair])
-            metadata[col] = formatted
-        # If the column is 'set_vna_meas', extract S-parameters
-        elif col == "set_vna_meas":
-            match = re.search(r"\bS\d{2}\b", str(raw_vals))
-            if match:
-                metadata.setdefault(col, []).append(match.group())
-        # Remove the suffix from the sweep_pts column and just report the value
-        elif "sweep_pts" in col.lower():
-            # Extract just the numeric portion from each entry
-            values = [re.search(r"\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", str(v)) for v in raw_vals]
-            cleaned = [match.group() if match else "N/A" for match in values]
-            metadata[col] = cleaned
-        else:
-            # Default: treat values as strings
-            values = [str(v) for v in raw_vals]
-            metadata[col] = values
+    # Check if it's a flat metadata table
+    if info is not None and {'key', 'value'}.issubset(info.columns):
+        # Parse flat metadata structure
+        for _, row in info.iterrows():
+            key = str(row['key']).strip()
+            val = str(row['value']).strip()
+            metadata.setdefault(key, []).append(val)
+    else:
+        # Parse wide metadata structure (legacy format)
+        for col in info.columns:
+            raw_vals = info[col].dropna().tolist()
+            if "freq_range" in col.lower():
+                parsed_vals = [extract_freq_tuple(v) for v in raw_vals]
+                parsed_vals = [t for t in parsed_vals if t]
+                formatted = []
+                for pair in parsed_vals:
+                    formatted.extend([f"{scale_to_ghz(val)} GHz" for val in pair])
+                metadata[col] = formatted
+            elif col == "set_vna_meas":
+                match = re.search(r"\bS\d{2}\b", str(raw_vals))
+                if match:
+                    metadata.setdefault(col, []).append(match.group())
+            elif "sweep_pts" in col.lower():
+                values = [re.search(r"\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", str(v)) for v in raw_vals]
+                cleaned = [match.group() if match else "N/A" for match in values]
+                metadata[col] = cleaned
+            else:
+                metadata[col] = [str(v) for v in raw_vals]
 
-    # Access the tables containing different types of data
+    # Grab standard tables
     data = grab('table_data')
     sweep = grab('table_sweep')
     step = grab('table_step')   # Note step will be empty in a 1D measurement
     # Get the headers for the sweep and step tables, if they exist
     sweep_headers = sweep.columns.tolist() if sweep is not None else []
     step_headers  = step.columns.tolist()  if step is not None else []
-    # End the connection to the database
-    db.close_db()
-    # Return a dictionary containing the data, sweep, step, and metadata
-    return {
+
+    # Build the results dictionary
+    result = {
         "data": data.to_numpy() if data is not None else None,
         "sweep": sweep.to_numpy() if sweep is not None else None,
         "step": step.to_numpy() if step is not None else None,
         "metadata": metadata,
         "sweep_headers": sweep_headers,
         "step_headers": step_headers}
+
+    # Add other tables as needed
+    for table_name in available_tables:
+        if table_name not in ['metadata', 'general_metadata', 'table_info',
+                              'table_data', 'table_sweep', 'table_step']:
+            table_df = grab(table_name)
+            result[table_name] = table_df.to_numpy() if table_df is not None else None
+
+    # End the connection to the database
+    db.close_db()
+    # Return a dictionary containing the data, sweep, step, and metadata
+    return result
 
 # Generate a unique filename (used for saving figures)
 def get_unique_filename(save_dir, base_name, extension=".jpg", use_date=True,
@@ -165,12 +182,14 @@ def get_unique_filename(save_dir, base_name, extension=".jpg", use_date=True,
 
 # Try to pull the format from the metadata for later use
 def get_vna_format(metadata):
-    # Try to call to the format key in the metadata dictionary
-    try:
-        return metadata['format'][0].upper()
-    # If the format key cannot be retrieved
-    except KeyError:
-        raise KeyError('Missing format key in metadata')
+    # Try to find the key 'format' regardless of case
+    for key in metadata.keys():
+        if key.strip().lower() == 'format':
+            try:
+                return str(metadata[key][0]).upper()
+            except (IndexError, TypeError):
+                break
+    raise KeyError("Missing or malformed 'format' key in metadata")
 
 
 ###########################################################################################
@@ -206,29 +225,35 @@ def get_indexed_colors(num_lines, cmap_name='viridis'):
 def form_plot(num_meta: int=1, fig_w = 13, fig_h = 9, left_width = 2.5,
               right_width = 1, facecolors=None, titles=None):
     fig = plt.figure(figsize= (fig_w + 2*num_meta - 2, fig_h))
-    # Total columns is 1 for data and num_meta for metadata
-    total_cols = 1 + num_meta
-    right_width = [right_width] * num_meta
-    width_ratios = [left_width] + right_width
-    # Create a GridSpec layout
-    gs = GridSpec(1, total_cols, width_ratios=width_ratios, figure=fig)
-    # Create subplots using the GridSpec layout
-    ax_plot = fig.add_subplot(gs[0, 0])  # Data subplot
-    # Create an empty list to hold metadata axes
-    ax_meta_list = []
-    # Loop through the number of metadata sections to create subplots
-    for i in range(num_meta):
-        # Create a new subplot for each metadata section
-        ax = fig.add_subplot(gs[0, i + 1])
-        ax.axis('off')  # Turn off the axis for metadata subplots
-        # Set the face color if provided
-        if facecolors and i < len(facecolors):
-            ax.set_facecolor(facecolors[i])
-        # Title are assigned in the metadata table function
-        # Append the axis to the list
-        ax_meta_list.append(ax)
-    # Return the figure components
-    return fig, ax_plot, ax_meta_list
+    # If no metadata, return single axis
+    if num_meta == 0:
+        ax_plot = fig.add_subplot(111)  # Full figure
+        ax_meta_list = []  # Empty list since no metadata
+        return fig, ax_plot
+    else:
+        # Total columns is 1 for data and num_meta for metadata
+        total_cols = 1 + num_meta
+        right_width = [right_width] * num_meta
+        width_ratios = [left_width] + right_width
+        # Create a GridSpec layout
+        gs = GridSpec(1, total_cols, width_ratios=width_ratios, figure=fig)
+        # Create subplots using the GridSpec layout
+        ax_plot = fig.add_subplot(gs[0, 0])  # Data subplot
+        # Create an empty list to hold metadata axes
+        ax_meta_list = []
+        # Loop through the number of metadata sections to create subplots
+        for i in range(num_meta):
+            # Create a new subplot for each metadata section
+            ax = fig.add_subplot(gs[0, i + 1])
+            ax.axis('off')  # Turn off the axis for metadata subplots
+            # Set the face color if provided
+            if facecolors and i < len(facecolors):
+                ax.set_facecolor(facecolors[i])
+            # Title are assigned in the metadata table function
+            # Append the axis to the list
+            ax_meta_list.append(ax)
+        # Return the figure components
+        return fig, ax_plot, ax_meta_list
 
 
 def meta_table(ax, metadata: dict, title: str = 'Metadata', fontsize=12,
@@ -395,6 +420,137 @@ def reshape_to_2dz(x, y, z):
     out_y = unique_y
     return out_x, out_y, out_z
 
+
+
+
+
+
+
+
+def reshape_to_3d(
+    x, y, z, values,
+    *,
+    fill_value=np.nan,
+    agg: Literal['raise', 'first', 'last', 'mean', 'sum'] = 'raise',
+    flips: Tuple[bool, bool, bool] = (False, True, False),
+):
+    """
+    Convert scattered (x, y, z, value) records into a dense 3D array on
+    a rectilinear grid defined by the unique coordinates of x, y, and z.
+
+    Parameters
+    ----------
+    x, y, z : array-like, shape (N,)
+        Coordinate arrays. They must be from a rectilinear grid (all combos
+        of unique x * unique y * unique z may exist; missing ones become fill_value).
+    values : array-like, shape (N,)
+        Data to place into the 3D voxel grid at the corresponding (x, y, z).
+    fill_value : scalar, default np.nan
+        Fill for voxels with no data.
+    agg : {'raise','first','last','mean','sum'}, default 'raise'
+        How to handle duplicate samples that map to the same (x, y, z) voxel:
+          - 'raise' : error if duplicates are found
+          - 'first' : keep the first occurrence
+          - 'last'  : keep the last occurrence (NumPy assignment default)
+          - 'mean'  : average all duplicates
+          - 'sum'   : sum all duplicates
+    flips : (flip_x, flip_y, flip_z), default (False, True, False)
+        If True for an axis, reverse that axis in the output. The default flips Y
+        to match typical image-style display (row 0 at top), analogous to your 2D flip.
+
+    Returns
+    -------
+    out_x, out_y, out_z : np.ndarray
+        The unique axis coordinates after any flips, sorted to match V.
+    V : np.ndarray, shape (len(out_z), len(out_y), len(out_x))
+        The 3D volume where V[k, j, i] corresponds to (out_x[i], out_y[j], out_z[k]).
+
+    Notes
+    -----
+    - Axis order in V is (Z, Y, X), so X is the fastest-varying (last) dimension.
+    - If your grid is complete and values are already sorted in (z, y, x) raster order,
+      a simple reshape(values, (len(zs), len(ys), len(xs))) suffices. This function is
+      robust to arbitrary ordering.
+    """
+    x = np.asarray(x)
+    y = np.asarray(y)
+    z = np.asarray(z)
+    values = np.asarray(values)
+
+    if not (x.shape == y.shape == z.shape == values.shape):
+        raise ValueError("x, y, z, and values must all have the same shape")
+
+    # Unique sorted axes
+    ux = np.unique(x)
+    uy = np.unique(y)
+    uz = np.unique(z)
+    nx, ny, nz = len(ux), len(uy), len(uz)
+
+    # Map each coordinate to its axis index
+    ix = np.searchsorted(ux, x)
+    iy = np.searchsorted(uy, y)
+    iz = np.searchsorted(uz, z)
+
+    shape = (nz, ny, nx)
+    V = np.full(shape, fill_value)
+
+    if agg in ('mean', 'sum'):
+        # Accumulate and divide (for mean) using np.add.at to handle duplicates
+        acc = np.zeros(shape, dtype=float)
+        cnt = np.zeros(shape, dtype=int)
+        np.add.at(acc, (iz, iy, ix), values.astype(float))
+        np.add.at(cnt, (iz, iy, ix), 1)
+
+        if agg == 'mean':
+            with np.errstate(invalid='ignore', divide='ignore'):
+                V = acc / cnt
+            V[cnt == 0] = fill_value
+        else:  # 'sum'
+            V = acc
+            V[cnt == 0] = fill_value
+
+    elif agg == 'last':
+        # NumPy assignment keeps the last occurrence for duplicates
+        V[iz, iy, ix] = values
+
+    elif agg == 'first':
+        # Keep the first occurrence for each voxel (vectorized)
+        flat = np.ravel_multi_index((iz, iy, ix), shape)
+        order = np.argsort(flat, kind='stable')        # stable sort preserves firsts
+        flat_sorted = flat[order]
+        uniq_flat, first_pos = np.unique(flat_sorted, return_index=True)
+        src_idx = order[first_pos]
+        V = np.full(shape, fill_value)
+        V[np.unravel_index(uniq_flat, shape)] = values[src_idx]
+
+    else:  # 'raise'
+        flat = np.ravel_multi_index((iz, iy, ix), shape)
+        _, counts = np.unique(flat, return_counts=True)
+        if np.any(counts > 1):
+            raise ValueError("Duplicate (x, y, z) coordinates found. "
+                             "Use agg='first', 'last', 'mean', or 'sum'.")
+        V[iz, iy, ix] = values
+
+    # Optional flips for display orientation
+    flip_x, flip_y, flip_z = flips
+    if flip_x:
+        V = V[:, :, ::-1]
+        ux = ux[::-1]
+    if flip_y:
+        V = V[:, ::-1, :]
+        uy = uy[::-1]
+    if flip_z:
+        V = V[::-1, :, :]
+        uz = uz[::-1]
+
+    return ux, uy, uz, V
+
+
+
+
+
+
+
 def to_magnitude(real, imag):
     return np.sqrt(real**2 + imag**2)
 
@@ -438,7 +594,8 @@ def general_plt(ax, xlabel=None, ylabel=None, title=None, log_y=None, ylims=None
 
 
 # 1D Plot ------------------------------------------------------------------------------- #
-def form_1d_plot(ax, sweep, data, meta, filename=None, sweep_type=None, style=None):
+def form_1d_plot(ax, sweep, data, meta=None, filename=None, sweep_type=None, 
+                 style=None, lock_type='R', plot_style='-'):
     # Clear the axis before plotting
     ax.clear()
 
@@ -459,13 +616,56 @@ def form_1d_plot(ax, sweep, data, meta, filename=None, sweep_type=None, style=No
             return
         # Scale the VNA sweep from Hz to GHz.  Also for a 'freq_range' sweep, the measured
         # amplitude is stored in data[:,4] (column number 5).
-        ax.plot(sweep*1e-9, data[:,4], 
+        ax.plot(sweep*1e-9, data[:,4], plot_style,
                        color=style['line_color'], 
                        linewidth=style['line_width'])
         # Set freq_range plot settings
         general_plt(ax, xlabel="Frequency (GHz)", ylabel=y_label,
                     title=filename, log_y=False, ylims=None,
                     style=style, legend=False)
+        
+    elif sweep_type == 'vsign':
+        # Select the correct lock-in channel based on lock_type
+        if lock_type.upper() == 'R':
+            data = np.sqrt(data[:,3]**2 + data[:,4]**2)*1e3  # Magnitude from X and Y
+            y_label = "Lock-in R (mV)"
+        elif lock_type.upper() == 'X':
+            data = data[:,3]*1e3  # X channel
+            y_label = "Lock-in X (mV)"
+        elif lock_type.upper() == 'Y':
+            data = data[:,4]*1e3  # Y channel  
+            y_label = "Lock-in Y (mV)"
+        else:
+            print(f"Unknown lock_type: {lock_type}. Use 'R', 'X', or 'Y'.")
+            return
+        # Scale the Vac axis down by its attenuation factor (4) and scale to mV
+        ax.plot(sweep*250, data, plot_style,
+                       color=style['line_color'], 
+                       linewidth=style['line_width'])
+        # Set freq_range plot settings
+        general_plt(ax, xlabel=r"$V_{ac}$ (mV)", ylabel=y_label,
+                    title=filename, log_y=False, ylims=None,
+                    style=style, legend=False)
+        
+    elif sweep_type == 'pressure1':
+        y_label = "Tank Pressure (Torr)"
+        ax.plot(sweep, data, plot_style,
+                color=style['line_color'],
+                linewidth=style['line_width'])
+        general_plt(ax, xlabel="Time (s)", ylabel=y_label,
+                    title=filename, log_y=False, ylims=None,
+                    style=style, legend=False)
+        
+    elif sweep_type == 'pressure2':
+        y_label = "Line Pressure (Torr)"
+        ax.plot(sweep, data, plot_style,
+                color=style['line_color'],
+                linewidth=style['line_width'])
+        general_plt(ax, xlabel="Time (s)", ylabel=y_label,
+                    title=filename, log_y=False, ylims=None,
+                    style=style, legend=False)
+
+        
     # add other sweep_type conditions as needed
 
 
@@ -562,6 +762,38 @@ def form_2d_plot(ax, data, meta, filename=None, sweep_type=None,
         cbar.set_label(z_label, 
                        fontsize=style['fontsize'], 
                        labelpad=style['labelpad'])
+        
+    # Filling curve plot creation
+    if sweep_type == 'fill':
+        # Extract columns based on your data structure
+        pressures    = data[:, 2]  # Pressure1
+        frequencies  = data[:, 4]  # Frequency
+        real_col     = data[:, 5]
+        imag_col     = data[:, 6]
+
+        # Compute S21 amplitude in dB
+        measurements = 20 * np.log10(np.sqrt(real_col**2 + imag_col**2))
+
+        # Reshape into 2D grid for pcolormesh
+        data_x, data_y, data_z = reshape_to_2dz(pressures, frequencies, measurements)
+        data_y *= 1e-9  # Convert Hz to GHz
+
+        # Plot the 2D map
+        mesh = ax.pcolormesh(data_x, data_y, data_z,
+                            shading=style['shading'],
+                            cmap=style['color_map'],
+                            vmin=vmin if vmin else int(data_z.min()),
+                            vmax=vmax if vmax else int(data_z.max()))
+
+        # Axis labels
+        ax.set_xlabel("Pressure1 (Torr)", fontsize=style['fontsize'], labelpad=style['labelpad'])
+        ax.set_ylabel("Frequency (GHz)", fontsize=style['fontsize'], labelpad=style['labelpad'])
+
+        # Colorbar
+        fig = ax.get_figure()
+        cbar = fig.colorbar(mesh, ax=ax)
+        cbar.set_label("S21 (dB)", fontsize=style['fontsize'], labelpad=style['labelpad'])
+
 
     # General 2D plot settings 
     if filename:

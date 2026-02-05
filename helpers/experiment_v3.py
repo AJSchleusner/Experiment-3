@@ -30,14 +30,24 @@ import numpy as np
 import warnings
 import os.path
 import os
+import sys
+import io
 import logging
 import pyvisa
 import sqlite3
+import json
 import pandas as pd
+import time
+import threading
+import itertools
 
-from time import sleep, strftime
+
+from contextlib import redirect_stdout, redirect_stderr
+from time import sleep, strftime, time, localtime
+from sklearn import base
 from tabulate import tabulate
 from tqdm import tqdm
+from typing import Dict, Sequence, Callable, Tuple, Optional, List
 from newinstruments.BlueFors import BlueFors
 bluefors = BlueFors()
 from plot_setup import live_plot as lp
@@ -56,20 +66,48 @@ from IPython.display import display, HTML, clear_output
 
 # Instrument connection summary
 instrument_status = []
+instruments = {}
 
 # Import the instrument drivers 
-from newinstruments.vna_E5071_2 import *
-from newinstruments.DPG202 import *
+from newinstruments.vna_N5230A import *
+from newinstruments.DPG202 import DPG202
+from newinstruments.BlueFors import BlueFors
+from newinstruments.mcc_daq import *
 from pymeasure.instruments.srs import sr830, sr844
 from pymeasure.instruments.yokogawa import yokogawa7651 as y7651
 from pymeasure.instruments.yokogawa import yokogawaGS200 as ygs
 from pymeasure.instruments.agilent import Agilent33500
+import serial
+import sys
+import io
+
+# to still implement
+#from newinstruments.SignalHound import SignalHoundSA124B
+#from newinstruments.SignalCore import SignalCore
+#from newinstruments.HP8648B import *
+#from newinstruments.bncRF import *
+
+# Check available serial ports
+def port_check():
+    ports = serial.tools.list_ports.comports()
+    for port in ports:
+        print(f"{port.device}: {port.description}")
 
 # Instantiate function to create a device object and check connectivity
-def instantiate(name, cls, address, test_attr=None, printing=False):
+def instantiate(name, cls, address=None, serial=None, test_attr=None, 
+                scpi_test=None, printing=False):
     try:
-        # Create the device object with the given class and address
-        device = cls(address)
+        # Create the device object with the given class, address, and serial
+        if cls.__name__ == "N5230A":
+            device = cls(serial=serial, address=address)
+        else:
+            device = cls(address)
+
+        # Force a live SCPI query if provided
+        if scpi_test:
+            response = device.ask(scpi_test)
+            if not response or "ERROR" in response.upper():
+                raise ValueError(f"No valid response to SCPI query: {response}")
         # Start-up of the Yokogawa GS200 and 7651 power supplies
         if isinstance(device, (ygs.YokogawaGS200, y7651.Yokogawa7651)):
             try:
@@ -101,13 +139,34 @@ def instantiate(name, cls, address, test_attr=None, printing=False):
 
         # If a test attribute is provided, check its connectivity
         if test_attr:
-            _ = getattr(device, test_attr) 
+            attr = getattr(device, test_attr)
+            if callable(attr):
+                response = attr()
+                if not response or "ERROR" in str(response).upper():
+                    raise ValueError(f"{name} failed test_attr call: {response}")
+            else:
+                # If it's a property, just access it
+                _ = attr
+
         # If the device is successfully created and connected, append its status as True
-        instrument_status.append([name, True, address])
+        if cls.__name__ == "N5230A":
+            instrument_status.append([name, True, device.address])
+        else:
+            instrument_status.append([name, True, address])
         return device
     except Exception as e:
         # If the device cannot be created or connected, append its status as False
         instrument_status.append([name, False, address])
+        # If instantiation fails, close the device if it has a close() method
+        if 'device' in locals():
+            try:
+                device.close()
+                if printing:
+                    print(f"[{name}] Closed device after failure.")
+            except Exception:
+                if printing:
+                    print(f"[{name}] Could not close device after failure.")
+
         # If printing is enabled, print the error message
         if printing:
             print(f"[{name}] Connection failed: {e}")
@@ -116,33 +175,112 @@ def instantiate(name, cls, address, test_attr=None, printing=False):
 # This function connects to all the instruments used in the experiment. It creates global
 # variables for each instrument so that they can be accessed throughout the script and in
 # the Jupyter notebook. There is also the option to print the 
-def connect_instruments(printing=False):
-    # global variables to store the instrument objects. This is necessary to make them
-    # accessible throughout the script and in the Jupyter notebook.
-    global vna, lockin_LF, lockin_HF, dpg
-    global yoko_lch, yoko_rgd, yoko_lgt, yoko_rgt, yoko_lres, yoko_mres
-    global gen_sign, gen_fila
+def connect_instruments(printing=False, force_reconnect=False):
+    global instruments
+    # Close previous instruments if force_reconnect is True
+    if force_reconnect:
+        for inst in instruments.values():
+            if hasattr(inst, "close"):
+                try:
+                    inst.close()
+                except:
+                    pass
+    # Clear previous instruments and status    
+    instruments.clear()
+    instrument_status.clear()
+
 
     # All of the instruments in this experiment (at the moment)
-    vna       = instantiate(        "VNA",          E5071_2,  "GPIB0::2::INSTR",        test_attr="get_id", printing=printing)
-    lockin_LF = instantiate(      "SR830",      sr830.SR830, "GPIB0::10::INSTR",        test_attr="status", printing=printing)
-    lockin_HF = instantiate(      "SR844",      sr844.SR844, "GPIB0::11::INSTR",     test_attr="frequency", printing=printing)
-    dpg       = instantiate(     "DPG202",           DPG202,             "COM4", printing=printing)      # No test_attr needed 
+    instruments["vna13"]     = instantiate(    "VNA 120",           N5230A, serial = "MY46400271",     test_attr="get_id", printing=printing)
+    instruments["vna20"]     = instantiate(    "VNA 220",           N5230A, serial = "MY45000241",     test_attr="get_id", printing=printing)
+    instruments["lockin_LF"] = instantiate(      "SR830",      sr830.SR830, "GPIB0::10::INSTR",        test_attr="status", printing=printing)
+    instruments["lockin_HF"] = instantiate(      "SR844",      sr844.SR844, "GPIB0::11::INSTR",     test_attr="frequency", printing=printing)
+    instruments["dpg"]       = instantiate(     "DPG202",           DPG202,     address="COM4",     printing=printing)      # No test_attr needed 
+    instruments["daq"]       = instantiate_daq("MCC DAQ",          mcc_daq,                         printing=printing)      # No address needed
+    instruments["bluefors"]  = instantiate_bf("BlueFors",         BlueFors,                         printing=printing)
     # Yokogawa GS200 and 7651 power supplies
-    yoko_lch  = instantiate( "Yoko (lch)", ygs.YokogawaGS200, "GPIB0::7::INSTR",   test_attr="source_mode", printing=printing)
-    yoko_rgd  = instantiate( "Yoko (rgd)", ygs.YokogawaGS200, "GPIB0::1::INSTR",   test_attr="source_mode", printing=printing)
-    yoko_lgt  = instantiate( "Yoko (lgt)", ygs.YokogawaGS200,"GPIB0::21::INSTR",   test_attr="source_mode", printing=printing)
-    yoko_rgt  = instantiate( "Yoko (rgt)", ygs.YokogawaGS200, "GPIB0::6::INSTR",   test_attr="source_mode", printing=printing)
-    yoko_lres = instantiate("Yoko (lres)",y7651.Yokogawa7651,"GPIB0::24::INSTR",test_attr="source_voltage", printing=printing)
-    yoko_mres = instantiate("Yoko (mres)",y7651.Yokogawa7651,"GPIB0::25::INSTR",test_attr="source_voltage", printing=printing)
+    instruments["yoko_rch"]  = instantiate( "Yoko (rch)", ygs.YokogawaGS200, "GPIB0::7::INSTR",   test_attr="source_mode", printing=printing)
+    instruments["yoko_lgd"]  = instantiate( "Yoko (lgd)", ygs.YokogawaGS200, "GPIB0::1::INSTR",   test_attr="source_mode", printing=printing)
+    instruments["yoko_rgt"]  = instantiate( "Yoko (rgt)", ygs.YokogawaGS200,"GPIB0::21::INSTR",   test_attr="source_mode", printing=printing)
+    instruments["yoko_mgt"]  = instantiate( "Yoko (mgt)", ygs.YokogawaGS200, "GPIB0::6::INSTR",   test_attr="source_mode", printing=printing)
+    instruments["yoko_pin"]  = instantiate( "Yoko (pin)",y7651.Yokogawa7651,"GPIB0::24::INSTR",test_attr="source_voltage", printing=printing)
+    instruments["yoko_res"]  = instantiate( "Yoko (res)",y7651.Yokogawa7651,"GPIB0::25::INSTR",test_attr="source_voltage", printing=printing)
     # Agilent 33500 function generators
-    gen_sign  = instantiate("33500B (sign)",    Agilent33500,"GPIB0::19::INSTR",         test_attr="shape", printing=printing)
-    gen_fila  = instantiate("33500B (fila)",    Agilent33500,"GPIB0::17::INSTR",         test_attr="shape", printing=printing)
+    instruments["gen_sign"]  = instantiate("33500B (sign)",    Agilent33500,"GPIB0::19::INSTR",         test_attr="shape", printing=printing)
+    instruments["gen_fila"]  = instantiate("33500B (fila)",    Agilent33500,"GPIB0::17::INSTR",         test_attr="shape", printing=printing)
+
+    # Inject into notebook globals
+    globals().update(instruments)
+    # Return the full dictionary for optional use
+    return instruments
 
 # This function returns the controls for the sweep and step parameters and is used
 # extensively in the init_reads function.
 def get_controls(source, keys):
     return {key: source.get(key) for key in keys}
+
+# This function connects to the MCC DAQ device
+def instantiate_daq(name, cls, printing=False):
+    try:
+        device = cls()
+        if not printing:
+            # Suppress internal prints during device_detect()
+            original_stdout = sys.stdout
+            sys.stdout = io.StringIO()
+            try:
+                device.device_detect()
+            finally:
+                sys.stdout = original_stdout
+        else:
+            device.device_detect()
+        instrument_status.append([name, True, "USB Box"])
+        return device
+    except Exception as e:
+        instrument_status.append([name, False, "USB Box"])
+        if printing:
+            print(f"[{name}] Connection failed: {e}")
+        return None
+
+# This function connects to the BlueFors temperature readout device
+def instantiate_bf(name, cls, printing=False):
+    try:
+        device = cls()
+        # Optional: try a temperature read to confirm it's responsive
+        try:
+            _ = device.get_temperature(1)  # Channel 1 should always exist
+        except Exception as e:
+            raise Exception(f"{name} failed temperature query: {e}")
+        instrument_status.append([name, True, "USB Direct"])
+        return device
+    except Exception as e:
+        instrument_status.append([name, False, "USB Direct"])
+        if printing:
+            print(f"[{name}] Connection failed: {e}")
+        return None
+
+# Global variable for VNA
+vna = None
+
+# This function initializes all instruments and displays their connection status
+def init_instruments(printing=False, Table=True, force_reconnect=False):
+    # Set the instruments as global variables
+    global instruments, instrument_status, vna
+    # Clear previous instrument status for fresh check
+    instrument_status.clear()
+    # Connect to all instruments
+    instruments = connect_instruments(printing=printing, force_reconnect=force_reconnect)
+    # Inject into notebook globals
+    globals().update(instruments)
+    # Determine which VNA to use (prioritize vna13 over vna20)
+    if instruments.get("vna13") and hasattr(instruments["vna13"], 'address'):
+        vna = instruments["vna13"]
+    elif instruments.get("vna20") and hasattr(instruments["vna20"], 'address'):
+        vna = instruments["vna20"]
+    else:
+        vna = None
+    if Table:
+        show_connection_table(instrument_status)
+    return instruments
 
 
 ###########################################################################################
@@ -195,142 +333,123 @@ def show_connection_table(status_list):
 ## Database Class ---------------------------------------------------------------------- ##
 ###########################################################################################
 
-# Create the database class
-class Create_DB():
-    # Create the initializer method for the class. This method is called when an instance
-    # of the class is created. 
-    def __init__(self, filename, sweep: dict, step: dict, measured: list, metadata: list):
-        # Connect to the SQLite database file. If the file does not exist, create it.
-        self.conn = sqlite3.connect(filename)
-        self.cursor = self.conn.cursor()
-        # Store the sweep, step, measured data, and metadata as class attributes
-        self.sweep = sweep
-        self.step = step
-        self.measured = measured
-        self.metadata = metadata
-        # Set the database structure and write the initial data to the database
-        with self.conn:
-            self.set_db_structure()
-            self.initial_write()
-
-    # Create the tables in the database based on the provided dictionary.
-    def create_table(self, tablename: str, dict: dict):
-        # Dictionary keys are the column headers over the data values
-        params_list = dict.get('params')
-        types_list = dict.get('types')
-        key_string = "("
-        for param, type in zip(params_list, types_list):
-            key_string = key_string + f"{param} {type}, "
-        key_string = key_string[:-2] + ")"
-        stmt = f"CREATE TABLE {tablename} {key_string}"    
-        self.cursor.execute(stmt)
-
-    # This method sets the structure of the database by creating the necessary tables.
-    def set_db_structure(self) -> None:
-        """
-        the structure of the database will be as follows:
-
-        5 tables:
-        table 1: experiment condition [run/stop]
-        table 2: sweep parameters [sweep_index, sweep_value, ...]
-        table 3: step parameters [step_index, step_value, ...]
-        table 4: measured data [sweep_index, step_index, data_values, ...]
-        table 5: metadata [all experiment class attributes]
-        """
-
-        # Store whether the experiment is running or stopped.  I generally haven't found
-        # any purpose in the 'table_cond' part of the saved databases.
-        dict_exp_cond = {'params': ['exp_cond'],'types': ['TEXT']}
-        self.create_table('table_cond', dict_exp_cond)
-
-        # Create the sweep table from the sweep parameters.
-        dict_sweep = {
-            'params': self.sweep.get('variable'),
-            'types': ['REAL'] * len(self.sweep.get('variable'))}
-        self.create_table('table_sweep', dict_sweep)
-
-        # Create the step table from the step parameters (if a step exists)
-        step_params = self.step.get('variable')
-        if step_params:  # Only create table if step variables are defined
-            dict_step = {
-                'params': step_params,
-                'types': ['REAL'] * len(step_params)}
-            self.create_table('table_step', dict_step)
-        # Create the measurement data table with step and sweep indices
-        measurement_name = ['step_index', 'sweep_index']
-        measurement_type = ['INTEGER'] * 2
-        measurement_name.extend(self.measured)
-        measurement_type.extend(['REAL'] * (len(self.measured)))
-        # Create the table with the measurement data
-        dict_measured = {'params': measurement_name, 'types': measurement_type}
-        self.create_table('table_data', dict_measured)
-
-        # Create the metadata table with all experiment class attributes
-        dict_metadata = {
-            'params': [item[0] for item in self.metadata],
-            'types': ['TEXT'] * len(self.metadata)}
-        self.create_table('table_info', dict_metadata)
-
-    # Insert data into the table for all columns in the table for multiple rows at once.
-    def insert_data_many(self, tablename: str, data: list) -> None:
-        num = len(data[0])
-        # SQL statement to:
-        # 1 - set f-string to table name
-        # 2 - set number of ? placeholders based on the number of columns
-        # 3 - close the list 
-        stmt = f"INSERT INTO {tablename} VALUES({','.join(['?'] * num)})"
-        self.cursor.executemany(stmt, data)
-        # commit the changes to the database
+class generalDB:
+    # Initialize the database connection
+    def __init__(self, filename: str, schema: dict[str, dict]):
+        self.conn    = sqlite3.connect(filename)
+        self.cursor  = self.conn.cursor()
+        self.schema  = schema
+        self._make_tables()
+    # Create the individual tables based on the schema dictionary
+    def _make_tables(self):
+        for table, defn in self.schema.items():
+            if not defn['params']:  # Skip tables with no columns
+                continue
+            cols = ", ".join(f'"{p}" {t}' for p, t in zip(defn['params'], defn['types']))
+            self.cursor.execute(f"CREATE TABLE IF NOT EXISTS {table} ({cols})")
         self.conn.commit()
-
-    # Initial writing to the tables to set them up for later population with data.
-    def initial_write(self) -> None:
-        # Insert 'run' to the condition table
-        self.insert_data_many('table_cond', [('run',)])
-        # Batch insert sweep points
-        sweep_lists = self.sweep.get('sweep lists')
-        sweep_data = [tuple([sweep_lists[j][i] for j in range(len(sweep_lists))])
-                      for i in range(len(sweep_lists[0]))]
-        self.insert_data_many('table_sweep', sweep_data)
-        # If there is step data, batch insert step points
-        step_lists = self.step.get('step lists')
-        if step_lists and len(step_lists) > 0:
-            step_data = [tuple([step_lists[j][i] for j in range(len(step_lists))])
-                        for i in range(len(step_lists[0]))]
-            self.insert_data_many('table_step', step_data)
-        # Insert metadata into the table_info table
-        meta_row = [str(item[1]) if not isinstance(item[1], tuple) else item[1]
-                     for item in self.metadata]
-        self.insert_data_many('table_info', [tuple(meta_row)])
-
-    # Wrapper for insert_data_many
-    def measurement_write_many(self, tablename: str, data) -> None:
-        with self.conn:
-            self.insert_data_many(tablename, data)
-
-    # This adds a new column to a table in the database with the specified name.
-    def add_col_to_table(self, tablename: str, column_name: str):
-        stmt = f"ALTER TABLE {tablename} ADD COLUMN {column_name} REAL"
-        self.cursor.execute(stmt)
-
-    # This retrieves data from the database for live plotting
-    def get_data_live_plot(self, index1 = None, index2 = None, index2a = None, index2b = None, index3 = None):
-        sweep = self.cursor.execute(f"SELECT * from {'table_sweep'}").fetchall()
-        sweep = np.array(sweep)  # Convert list to NumPy array
-        sweep = sweep[0:index1, :]  # Perform slicing
-        step  = self.cursor.execute(f"SELECT * from {'table_step'}").fetchall()
-        step  = np.array(step)  # Convert list to NumPy array
-        step  = step[index2a:(index2 + index2a + 1), index2b]  # Perform slicing
-        data  = self.cursor.execute(f"SELECT * from {'table_data'}").fetchall()
-        data  = np.array(data)  # Convert list to NumPy array
-        data  = data[0:index3, :]  # Perform slicing
-        return sweep, step, data
-
-    # Code for closing the database connection and adding 'stop' to the condition table.
-    def sql_close(self):
-        with self.conn:
-            self.insert_data_many('table_cond', [('stop',)])
+    # Insert multiple rows into a specified table
+    def insert_many(self, table: str, rows: list[tuple]):
+        ph = ",".join(["?"] * len(rows[0]))
+        self.cursor.executemany(f"INSERT INTO {table} VALUES({ph})", rows)
+        self.conn.commit()
+    # Select all rows from a specified table
+    def select_all(self, table: str):
+        self.cursor.execute(f"SELECT * FROM {table}")
+        return self.cursor.fetchall()
+    # Select with a WHERE clause
+    def select_where(self, table: str, where: str, params: tuple = ()):
+        self.cursor.execute(f"SELECT * FROM {table} WHERE {where}", params)
+        return self.cursor.fetchall()
+    # Close the database connection
+    def close(self):
         self.conn.close()
+
+def log_filament_metadata(db: generalDB, filament_obj, daq_obj, success: bool = None,
+                          deltaT: str = None):
+    # Flatten metadata
+    filament_meta = {
+        "amplitude": filament_obj.amplitude,
+        "offset": filament_obj.offset,
+        "frequency": filament_obj.frequency,
+        "shape": filament_obj.shape,
+        "duty_cycle": filament_obj.square_dutycycle,
+        "polarity": filament_obj.polarity,
+        "burst_mode": filament_obj.burst_mode,
+        "burst_ncycles": filament_obj.burst_ncycles,
+        "burst_state": filament_obj.burst_state,
+        "trigger_source": filament_obj.trigger_source,
+        "trigger_delay": filament_obj.trigger_delay,
+        "output_polarity": filament_obj.output_polarity,
+        "output_state": filament_obj.output
+    }
+
+    daq_meta = {
+        "measurement_time": daq_obj.measurement_time,
+        "sampling_rate": daq_obj.sampling_rate,
+        "voltage_range": daq_obj.voltage_range,
+        "status": daq_obj.status
+    }
+
+    # Format rows for insertion
+    rows = []
+    rows += [("filament", key, str(val)) for key, val in filament_meta.items()]
+    rows += [("daq", key, str(val)) for key, val in daq_meta.items()]
+    rows.append(("general", "datetime", strftime("%Y-%m-%d %H:%M:%S", localtime())))
+    rows.append(("general", "deltaT", str(deltaT)))
+    rows.append(("general", "success", str(success)))
+
+    # Insert into database
+    db.insert_many('filament_metadata', rows)
+
+
+# Schema for filament firing experiments database structure
+filament_schema = {
+    'filament_metadata': {
+        'params': ['category', 'key', 'value'],
+         'types': ['TEXT', 'TEXT', 'TEXT']
+    },
+    'general_metadata': {
+        'params': ['category', 'key', 'value'],
+        'types': ['TEXT', 'TEXT', 'TEXT']
+    },
+    'daq_data': {
+        'params': ['time', 'filament_volt', 'lockin_x'],
+         'types': ['TEXT', 'REAL', 'REAL']
+    },
+    'transport_test': {
+        'params': ['channel_volt', 'lockin_x', 'lockin_y'],
+         'types': ['REAL', 'REAL', 'REAL']
+    },
+    'figures': {
+        'params': ['fig_name', 'image_blob'],
+         'types': ['TEXT', 'BLOB']
+    }
+}
+
+def write_to_database(db: generalDB, sweep_data: list, step_indices: Optional[list] = None):
+    """
+    Efficiently insert sweep_data into the database with optional step indexing.
+    Compatible with generalDB.
+    """
+    def sanitize_row(row):
+        clean = []
+        for val in row:
+            if isinstance(val, complex):
+                clean.extend([val.real, val.imag])
+            else:
+                clean.append(val)
+        return tuple(clean)
+
+    all_rows = []
+    for sweep_index, row in enumerate(sweep_data):
+        step_index = step_indices[sweep_index] if step_indices is not None else 0
+        full_row = (step_index, sweep_index) + tuple(row)
+        sanitized = sanitize_row(full_row)
+        all_rows.append(sanitized)
+
+    # Use generalDB's insert_many method
+    db.insert_many('table_data', all_rows)
 
 
 ###########################################################################################
@@ -370,7 +489,7 @@ def __split_name_suffix(name: str):
 
 # Below creates the path for storing the data and the filename to a SQLite database. This
 # will automatically create the filename with the date in a folder with the date.
-def create_path_filename(measurement_name: str) -> str:
+def create_path_filename(measurement_name: str, overwrite: bool = False) -> str:
     # Get the date-stamp for directory organization
     date_str = strftime("%Y-%m-%d")
     # Join this date-stamped directory with the larger 'data' file
@@ -379,17 +498,22 @@ def create_path_filename(measurement_name: str) -> str:
     os.makedirs(subdir, exist_ok=True)
     # Split the numeric suffix from the measurement name
     base, suf = __split_name_suffix(measurement_name)
-    # Loop through file names to find the next available filename
-    while True:
-        # Name the file date_base-suffix.db unless the suffix is 0
-        filename = f"{date_str}_{base}-{suf}.db" if suf > 0 else f"{date_str}_{base}.db"
-        # Check if the file already exists in the subdir
+
+    # If overwrite is True, return the first filename without checking
+    if overwrite:
+        filename = f"{date_str}_{base}.db" if suf == 0 else f"{date_str}_{base}-{suf}.db"
         filepath = os.path.join(subdir, filename)
-        # If the file does not exist, break the loop
+        print(f"Overwrite enabled: using {filename}")
+        return filepath
+
+    # Otherwise, find the next available filename
+    while True:
+        filename = f"{date_str}_{base}-{suf}.db" if suf > 0 else f"{date_str}_{base}.db"
+        filepath = os.path.join(subdir, filename)
         if not os.path.isfile(filepath):
             break
-        # If the file exists, increment the suffix and try again
         suf += 1
+
     # If the suffix is greater than 0, print a message indicating a filename conflict    
     if suf > 0:
         print(f"Avoiding overwrite, new filename: {filename}")
@@ -448,40 +572,6 @@ def apply_control(device, method_name, value):
     # If it is not callable, it is an attribute
     else:
         setattr(device, method_name, value)
-
-def write_to_database(sqldb, sweep_data, step_indices):
-    """
-    Efficiently insert sweep_data into the database with optional step indexing.
-    """
-    # Sanitize the row data to handle complex numbers
-    def sanitize_row(row):
-        clean = []
-        for val in row:
-            if isinstance(val, complex):
-                clean.extend([val.real, val.imag])
-            else:
-                clean.append(val)
-        return tuple(clean)
-    # Prepare the data for insertion
-    all_rows = []
-    for sweep_index, row in enumerate(sweep_data):
-        step_index = step_indices[sweep_index] if step_indices is not None else 0
-        full_row = (step_index, sweep_index) + tuple(row)
-        sanitized = sanitize_row(full_row)
-        all_rows.append(sanitized)
-    # Use batch insertion
-    sql = "INSERT INTO table_data VALUES (" + ", ".join(["?"] * len(all_rows[0])) + ")"
-    with sqldb.conn:
-        sqldb.cursor.executemany(sql, all_rows)
-
-
-
-
-
-
-
-
-
 
 
 ###########################################################################################   
@@ -607,7 +697,7 @@ class exp3():
     comment1 = None
     comment2 = None
     comment3 = None
-    tconst   = 0.1
+    tconst   = 0.5
 
 
     #######################################################################################
@@ -620,7 +710,8 @@ class exp3():
                  ctrl_instrument: dict, 
                   vna_instrument: dict, 
                  read_instrument: dict,
-             bluefors_instrument: dict):
+             bluefors_instrument: dict,
+             instrument_registry: dict):
         # Set the private variables for the control and readout of instruments.
         self.__reads = read_instrument
         self.__ctrls = ctrl_instrument
@@ -629,6 +720,9 @@ class exp3():
         # Set the private variable for the VNA, this needs to be before being 
         # called in the reset_instruments method.
         self.__vna = vna_instrument
+        # Set the private variable for the instrument registry, this is used to
+        # look up instrument objects by name.
+        self.__registry = instrument_registry
         # Reset the instruments to their default states
         self.reset_instruments()
 
@@ -761,10 +855,296 @@ class exp3():
             print('no VNA instrument to initialize')
         sleep(ramp_time)
         try:
-            vna.auto_scale(channel = 1)
+            for key in self.__vna:
+                getattr(self.__vna[key][0], "auto_scale")(channel=1)
         except:
             pass
         print('instruments are initialized!')
+
+
+
+    #######################################################################################
+    ## Electron Deposition ------------------------------------------------------------- ##
+    #######################################################################################
+
+    # Prepare electrodes for electron deposition
+    def deposition_prep(self, Vch=0.8, Vres=1.2, Vgt=-0.4, Vpn=-0.2, Vac=0.1) -> None:
+        # Turn on transport drive 
+        self.__registry['gen_sign'].output    = 'on'
+        self.__registry['gen_sign'].amplitude = Vac
+        # Ramp electrode voltages
+        self.__registry['yoko_pin'].ramp_to_voltage( Vpn, duration=1)
+        self.__registry['yoko_res'].ramp_to_voltage(   0, duration=1)
+        self.__registry['yoko_lgd'].ramp_to_voltage( Vgt, duration=1)
+        self.__registry['yoko_rgt'].ramp_to_voltage( Vch, duration=1)
+        self.__registry['yoko_mgt'].ramp_to_voltage( Vch, duration=1)
+        self.__registry['yoko_rch'].ramp_to_voltage( Vch, duration=1)
+        # Empty reservoirs
+        self.__registry['yoko_res'].enable_source()
+        self.__registry['yoko_res'].ramp_to_voltage(-0.8, duration=1)
+        sleep(5)
+        # Ramp reservoir voltage
+        self.__registry['yoko_res'].ramp_to_voltage(Vres, duration=1)
+        sleep(1)
+
+    # Prepare electrodes for a transport sweep
+    def transport_prep(self, Vch=0.0, Vres=0.7, Vgt=-0.4, Vpn =-0.2) -> None:
+        # Ramp electrode voltages
+        self.__registry['yoko_pin'].ramp_to_voltage( Vpn, duration=1)
+        self.__registry['yoko_res'].ramp_to_voltage(Vres, duration=1)
+        self.__registry['yoko_lgd'].ramp_to_voltage( Vgt, duration=1)
+        self.__registry['yoko_rgt'].ramp_to_voltage( Vch, duration=1)
+        self.__registry['yoko_mgt'].ramp_to_voltage( Vch, duration=1)
+        self.__registry['yoko_rch'].ramp_to_voltage( Vch, duration=1)
+        sleep(2)
+
+    def deposit_electrons(self) -> tuple:
+        self.__registry['gen_fila'].output = 'on'
+        print('filament turned on')
+        sleep(0.3)
+        self.__registry['gen_fila'].trigger()
+        print('scan started')
+        output = self.__registry['daq'].scan()
+        self.__registry['gen_fila'].output = 'off'
+        print('filament turned off')
+        return output
+    
+    def zero_instruments(self) -> None:
+        self.__registry['gen_sign'].output = 'off'
+        self.__registry['gen_sign'].amplitude = 0.01
+        # Ramp electrode voltages
+        self.__registry['yoko_pin'].ramp_to_voltage( 0, duration=1)
+        self.__registry['yoko_res'].ramp_to_voltage( 0, duration=1)
+        self.__registry['yoko_lgd'].ramp_to_voltage( 0, duration=1)
+        self.__registry['yoko_rgt'].ramp_to_voltage( 0, duration=1)
+        self.__registry['yoko_mgt'].ramp_to_voltage( 0, duration=1)
+        self.__registry['yoko_rch'].ramp_to_voltage( 0, duration=1)
+        
+
+    @staticmethod
+    def normalize_daq(output):
+        """
+        Accepts any of the following and returns (t, ch1, ch2) as float arrays:
+        1) ndarray with shape (N, >=3): columns = [time, ch1, ch2, ...]
+        2) (t, ch1, ch2): three 1D arrays (same length)
+        3) (t, Y): where Y has shape (N, >=2), columns [ch1, ch2, ...]
+        """
+        # Case 2 or 3: tuple/list forms
+        if isinstance(output, (list, tuple)):
+            # 2) (t, ch1, ch2)
+            if len(output) == 3:
+                t, ch1, ch2 = map(np.asarray, output)
+                if t.ndim != 1 or ch1.ndim != 1 or ch2.ndim != 1:
+                    raise ValueError("Expected (t, ch1, ch2) to be 1D arrays.")
+                if not (len(t) == len(ch1) == len(ch2)):
+                    raise ValueError("t, ch1, ch2 must have the same length.")
+                t = t.astype(float); ch1 = ch1.astype(float); ch2 = ch2.astype(float)
+                if not np.all(np.diff(t) > 0):
+                    raise ValueError("Time column must be strictly increasing.")
+                return t, ch1, ch2
+            # 3) (t, Y) where Y is (N, >=2)
+            if len(output) == 2:
+                t, Y = output
+                t = np.asarray(t).astype(float)
+                Y = np.asarray(Y)
+                if Y.ndim != 2 or Y.shape[1] < 2:
+                    raise ValueError("Expected Y with shape (N, >=2) for ch1,ch2 in (t, Y).")
+                ch1 = Y[:, 0].astype(float)
+                ch2 = Y[:, 1].astype(float)
+                if not np.all(np.diff(t) > 0):
+                    raise ValueError("Time column must be strictly increasing.")
+                if len(t) != len(ch1):
+                    raise ValueError("t and Y must have the same number of rows.")
+                return t, ch1, ch2
+        # 1) Already a 2D array with at least 3 columns
+        arr = np.asarray(output)
+        if arr.ndim == 2 and arr.shape[1] >= 3:
+            t = arr[:, 0].astype(float)
+            ch1 = arr[:, 1].astype(float)
+            ch2 = arr[:, 2].astype(float)
+            if not np.all(np.diff(t) > 0):
+                raise ValueError("Time column must be strictly increasing.")
+            return t, ch1, ch2
+        # If we get here, the shape is unknown → print helpful diagnostics
+        shapes = None
+        if isinstance(output, (list, tuple)):
+            shapes = [(np.shape(x), type(x)) for x in output]
+        raise ValueError(f"Unsupported DAQ output format. "
+                        f"type={type(output)}, shape={np.shape(output)}, parts={shapes}")
+
+
+    # Search the phase space of deposition parameters
+    def deposition_sweep(
+        self,
+        *,
+        experiment_name: str,
+        sweep_axes: Dict[str, Sequence[float]],             # e.g., {"amp": [...], "frq": [...]}
+        setters: Dict[str, Callable[[float], None]],        # param -> callable(value) that applies just that param
+        datasaver,                                          # <-- REQUIRED: external DataSaver instance
+        daq,                                                # <-- REQUIRED: external DAQ handle (if not on self)
+        trigger_fn: Optional[Callable[[], object]] = None,  # Default to self.deposit_electrons
+        prep_fn: Optional[Callable[[dict], None]] = None,   # Reset the electron system
+        settle_s: float =  5.0,                             # Settle after cleaning
+        pause_s: float = 100.0,                             # Wait between firing loops
+        overwrite: bool = False,
+        extra_metadata: Optional[Dict[str, str]] = None,
+        verbose: bool = False,                              # show small status in tqdm postfix
+        quiet_trigger: bool = True,                         # suppress prints inside trigger_fn
+        default_Vres: float = 1.0,                          # used if prep_fn is None and Vres not swept
+        ):
+
+        """
+        N-D sweep with explicit dependency injection for datasaver and daq.
+        Assumes DAQ returns [time, ch1, ch2]. Saves long-form rows:
+        [<swept params>..., 'Time', 'Ch1', 'Ch2'].
+        """
+
+        # Set default trigger
+        if trigger_fn is None:
+            if not hasattr(self, "deposit_electrons"):
+                raise ValueError("No trigger_fn provided and expr has no deposit_electrons().")
+            trigger_fn = self.deposit_electrons
+
+        # Prepare sweep axes
+        axes_order  = list(sweep_axes.keys())
+        axes_values = [list(sweep_axes[name]) for name in axes_order]
+
+        # Validate that all sweep axes have corresponding setters where
+        # setters: param name -> callable(value)
+        missing = [p for p in axes_order if p not in setters]
+        if missing:
+            raise ValueError(f"Missing setters for: {missing}")
+
+        # Prepare to collect all columns and rows
+        columns = axes_order + ["Time", "Ch1", "Ch2"]
+        all_rows: List[Tuple[float, ...]] = []
+        time_axis_ref = None
+        ref_len = None
+
+        # Prepare metadata
+        metadata = {
+            "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "axes_order": ",".join(axes_order),
+            "daq_sampling_rate": getattr(daq, "sampling_rate", None),
+            "daq_measurement_time": getattr(daq, "measurement_time", None),
+        }
+        # Add extra metadata if provided
+        if extra_metadata:
+            metadata.update({str(k): str(v) for k, v in extra_metadata.items()})
+
+        # Total number of points in sweep(s)
+        total_pts = np.prod([len(v) for v in axes_values])
+
+        # Progress bar
+        with tqdm(total=total_pts, desc=experiment_name, unit="pt") as pbar:
+             # Iterate over all combinations of sweep axis values
+            for idx, point_vals in enumerate(itertools.product(*axes_values), start=1):
+
+                # Compose the current point context: {"amp": 3.4, "frq": 2.0, ...}
+                context = {name: float(val) for name, val in zip(axes_order, point_vals)}
+
+                # 1) Apply only the parameters you asked to sweep
+                for name, val in zip(axes_order, point_vals):
+                    setters[name](float(val))
+
+                # 2) Reset/prepare between iterations
+                if prep_fn is not None:
+                    prep_fn(context)
+                else:
+                    Vres_now = context.get("Vres", default_Vres)
+                    self.deposition_prep(Vres=Vres_now, Vpn=-0.1, Vac=0.1)
+
+                # 3)  Wait for settling time if specified
+                if settle_s > 0:
+                    time.sleep(settle_s)
+
+                # 4) Acquire; silence prints inside trigger_fn if requested
+                if quiet_trigger:
+                    _buf_out, _buf_err = io.StringIO(), io.StringIO()
+                    with redirect_stdout(_buf_out), redirect_stderr(_buf_err):
+                        out = trigger_fn()
+                else:
+                    out = trigger_fn()
+
+                # 5) Wait between iterations if specified
+                if pause_s > 0 and idx < total_pts:
+                    time.sleep(pause_s)
+
+                # 6) Normalize DAQ output
+                t, y1, y2 = self.normalize_daq(out)
+
+                # 7) Align time length if needed
+                if time_axis_ref is None:
+                    time_axis_ref = t
+                    ref_len = len(t)
+                elif len(t) != ref_len:
+                    N = min(len(t), ref_len)
+                    t, y1, y2 = t[:N], y1[:N], y2[:N]
+
+                # 8) Append rows
+                head = [float(v) for v in point_vals]
+                for ti, yi1, yi2 in zip(t, y1, y2):
+                    all_rows.append(tuple(head + [float(ti), float(yi1), float(yi2)]))
+                
+                # 9) Update progress bar
+                pbar.update(1)
+                if verbose:
+                    # show a compact postfix with current params
+                    pbar.set_postfix({k: f"{v:.4g}" for k, v in context.items()})
+
+
+        # Save to database
+        filepath = datasaver.save_to_db(
+            exp_name=experiment_name,
+            columns=columns,
+            sweep_data=all_rows,
+            sweep_lists=None,
+            step_lists=None,
+            metadata=metadata,
+            scheme=None,
+            overwrite=overwrite
+        )
+
+        # Build 3D cubes if exactly two parameters swept
+        cubes = None
+        if len(axes_order) == 2:
+            p1_vals, p2_vals = axes_values
+            T = len(time_axis_ref)
+            Z1 = np.empty((len(p1_vals), len(p2_vals), T), dtype=float)
+            Z2 = np.empty_like(Z1)
+            block = 0
+            for i, _ in enumerate(p1_vals):
+                for j, _ in enumerate(p2_vals):
+                    start = block * T
+                    stop  = start + T
+                    sl = np.asarray(all_rows[start:stop], dtype=float)
+                    Z1[i, j, :] = sl[:, -2]
+                    Z2[i, j, :] = sl[:, -1]
+                    block += 1
+            cubes = (np.asarray(p1_vals, float),
+                     np.asarray(p2_vals, float),
+                     np.asarray(time_axis_ref, float),
+                     Z1, Z2)
+
+        if verbose:
+            tqdm.write(f"Saved sweep to {filepath}")
+        return filepath, axes_order, axes_values, time_axis_ref, cubes
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
     #######################################################################################
@@ -859,35 +1239,66 @@ class exp3():
     ## SQL Database Definitions -------------------------------------------------------- ##
     #######################################################################################
    
-    # This function creates a new SQLite database for the experiment with the given name
-    # and data columns.  Of note is that the " -> Create_DB" indicates that this function
-    # will return an instance of the Create_DB class.
-    def create_sqldb(self, exp_name: str, data_columns: list) -> Create_DB:
-        """
-        Creates a new SQLite database file for storing sweep results.
 
-        Parameters:
-            exp_name (str): Name of the experiment, used to generate the file path.
-            data_columns (list): List of column names for the measurement data.
+    def build_meas_schema(self, measured_columns: list[str]) -> dict:
+        sweep_vars = self.__sweep.get('variable')
+        step_vars = self.__step.get('variable') if self.__step.get('variable') else []
 
-        Returns:
-            Create_DB: An instance of the database interface ready for data insertion.
-        """
-        # Format the data set name and location in accordance with the create_path_filename
-        # function defined above.
-        filepath = create_path_filename(exp_name)
-        # Create the SQLite database using the Create_DB class
-        return Create_DB(
-            filepath,
-            self.__sweep,
-            self.__step,
-            data_columns,
-            self.get_ClassAttributes(),
-        )
+        schema = {
+            'table_sweep': {
+                'params': sweep_vars,
+                'types': ['REAL'] * len(sweep_vars)
+            },
+            'table_step': {
+                'params': step_vars,
+                'types': ['REAL'] * len(step_vars)
+            },
+            'table_data': {
+                'params': ['step_index', 'sweep_index'] + measured_columns,
+                'types': ['INTEGER', 'INTEGER'] + ['REAL'] * len(measured_columns)
+            },
+            'metadata': {
+                'params': ['category', 'key', 'value'],
+                'types': ['TEXT', 'TEXT', 'TEXT']
+            }
+        }
+        return schema
     
-    # This function closes the SQLite database connection
-    def close_sqldb(self, sqldb: Create_DB) -> None:
-        sqldb.sql_close()
+
+    def save_experiment(self, exp_name: str, sweep_data: list, step_indices: list, savedata: bool = True):
+        if not savedata:
+            print("Data collected but not saved to database")
+            return
+
+        # Create file path and schema
+        filepath = create_path_filename(exp_name)
+        schema = self.build_meas_schema()
+
+        # Create the database
+        db = generalDB(filepath, schema)
+
+        # Insert sweep data
+        sweep_lists = self.sweep.get('sweep lists')
+        sweep_rows = [tuple(sweep_lists[j][i] for j in range(len(sweep_lists)))
+                    for i in range(len(sweep_lists[0]))]
+        db.insert_many('table_sweep', sweep_rows)
+
+        # Insert step data
+        step_lists = self.step.get('step lists')
+        if step_lists:
+            step_rows = [tuple(step_lists[j][i] for j in range(len(step_lists)))
+                        for i in range(len(step_lists[0]))]
+            db.insert_many('table_step', step_rows)
+
+        # Insert measurement data
+        db.insert_many('table_data', sweep_data)
+
+        # Insert metadata
+        meta_rows = [('experiment', key, str(value)) for key, value in self.metadata]
+        db.insert_many('metadata', meta_rows)
+
+        db.close()
+        print("Data saved to database")
 
 
     #######################################################################################
@@ -943,6 +1354,102 @@ class exp3():
             data = attr() if callable(attr) else attr
             vna_arr.append(data)
         return vna_arr
+
+
+    # This function performs a single acquisition from the VNA with optional
+    # frequency range and number of points settings.
+    def _acquire_vna_trace_once(self, vna: N5230A, *, read_dict, format_router,
+                                start=None, stop=None, num_pts=None,
+                                channel=1, use_averaging=None):
+        """
+        Deterministic single acquisition:
+        - If use_averaging is an int > 1, do an averaged sweep (one trigger runs all N sweeps).
+        - If None or 1, do exactly one sweep.
+        Configures optional start/stop/points if provided, then triggers and waits.
+        Returns: (freq[:,1], vna_arr[:,k]) with k depending on your format_router (e.g., 2 for Re/Im)
+        """
+
+        # Optional frequency plan
+        if (start is not None) and (stop is not None):
+            vna.set_frequency_range(start, stop, channel=channel)
+        if num_pts is not None and hasattr(vna, "set_sweep_points"):
+            vna.set_sweep_points(int(num_pts), channel=channel)
+
+        # RF on
+        if hasattr(vna, "set_output"):
+            vna.set_output(True)
+
+        # Hold (no continuous)
+        if hasattr(vna, "set_trigger_continuous"):
+            vna.set_trigger_continuous(False)  # :INIT:CONT OFF
+
+        # Averaging behavior
+        if use_averaging is None:
+            # honor current average state/count, but run deterministically
+            avg_count = vna.get_averages(channel=channel)
+            avg_on = vna.get_average_state(channel=channel) and (avg_count > 1)
+        else:
+            # force what the caller requested
+            if int(use_averaging) > 1:
+                vna.set_averages(int(use_averaging), channel=channel)
+                vna.set_average_state(True, channel=channel)
+                avg_on = True
+                avg_count = int(use_averaging)
+            else:
+                vna.set_average_state(False, channel=channel)
+                vna.set_averages(1, channel=channel)
+                avg_on = False
+                avg_count = 1
+
+        # Clear previous averaging accumulation
+        if hasattr(vna, "clear_averages"):
+            vna.clear_averages(channel=channel)
+
+        # If averaging is ON, let a single trigger complete the entire average
+        if hasattr(vna, "set_trigger_average_mode"):
+            vna.set_trigger_average_mode(avg_on)  # :TRIG:AVER ON/OFF
+
+        # One trigger starts either one sweep (avg OFF) or N-sweep average (avg ON)
+        vna.trigger_single(channel=channel)
+
+        # Wait for completion deterministically
+        if avg_on:
+            # Wait until averaging complete bit flips (STAT:OPER:AVER?)
+            # (averaging_complete returns True when done)
+            while not vna.averaging_complete(channel=channel):
+                time.sleep(0.05)
+            # As a final fence, OPC ensures everything has settled
+            vna.get_operation_completion()
+        else:
+            # One sweep: just wait OPC
+            vna.get_operation_completion()
+
+        # Pull vector data using your existing router+read path
+        vna_arr_raw = self.pull_vna_data(read_dict)
+        vna_arr = format_router.reshape_data(vna_arr_raw, vna)
+
+        # Frequency axis: prefer driver method if you have it; else compute from start/stop/points
+        if hasattr(vna, "get_fpoints"):
+            try:
+                freq_pts = vna.get_fpoints()  # prefer bound call if available
+                freq_index = np.asarray(freq_pts).reshape(-1, 1)
+            except TypeError:
+                # some drivers require channel or self passed; fallback
+                freq_pts = vna.get_fpoints(vna)
+                freq_index = np.asarray(freq_pts).reshape(-1, 1)
+        else:
+            if (start is None) or (stop is None):
+                # fall back to channel start/stop getters
+                start = vna.get_start_frequency(channel=channel)
+                stop = vna.get_stop_frequency(channel=channel)
+            if num_pts is None:
+                if hasattr(vna, "get_sweep_points"):
+                    num_pts = vna.get_sweep_points(channel=channel)
+                else:
+                    raise RuntimeError("No get_fpoints/get_sweep_points available to build frequency axis.")
+            freq_index = np.linspace(start, stop, int(num_pts), endpoint=True)[:, None]
+
+        return freq_index, vna_arr
 
 
     #######################################################################################
@@ -1004,12 +1511,15 @@ class exp3():
         # Since the instrument 'vna' is called explcitly in this function, this check was
         # added to ensure that the vna instrument is named exactly 'vna' before being
         # called to in this function.  If it is not defined, an error is raised.
-        try:
-            vna
-        except NameError:
+
+        if not self.__vna:
             raise RuntimeError('''
-                        Instrument 'vna' must be defined before calling init_reads()
-                        ''')  
+                               Instrument 'vna' must be defined before calling init_reads()
+                               ''')
+        
+        # The first VNA is defined as the variable 'vna' for later use
+        vna_key = list(self.__vna.keys())[0]
+        vna = self.__vna[vna_key][0]
 
 
         ###################################################################################
@@ -1206,50 +1716,75 @@ class exp3():
         # Turn on the vna averaging
         if hasattr(vna, "set_average_state"):
             vna.set_average_state(True)
+
+        
         # Handle the 'freq_range' keyword as a special no-sweep case
         if sweep_var == 'freq_range':
+
             # S1 will be the start frequency
             start_freq = sweep_list[0]
             # S2 will be the stop frequency
             stop_freq = sweep_list[-1]
-            # Apply frequency configuration
-            vna.set_frequency_range(start_freq, stop_freq)
-            # Apply the number of sweep points
-            vna.set_sweep_points(num_pts)
-            # Wait for the VNA to finish the sweep
-            self.vna_meas_wait(vna)
-            # Pull the VNA data from the read_dict
-            vna_arr_raw = self.pull_vna_data(read_dict)
-            vna_arr = format_router.reshape_data(vna_arr_raw, vna)
-            # Create a frequency index based on the number of sweep points
-            freq_index = np.linspace(start_freq, stop_freq, num_pts, endpoint=True)
-            # If step_val is a list or tuple, create a step index for each value
+
+            # Choose: one sweep or averaged result
+            #   - One sweep per step: use_averaging=1
+            #   - Honor current settings: use_averaging=None
+            #   - Force N-sweep average: use_averaging=N
+
+            freq_index, vna_arr = self._acquire_vna_trace_once(
+                vna,
+                read_dict=read_dict,
+                format_router=format_router,
+                start=start_freq,
+                stop=stop_freq,
+                num_pts=num_pts,
+                channel=1,
+                use_averaging=None)   # or 1 for exactly one sweep, or an int N
+
+            # Build step index column(s)
             if isinstance(step_val, (list, tuple)):
-                # Create multiple step index columns
-                step_index = np.stack([np.full_like(freq_index, val) for val in step_val], axis=1)
+                # 2D array (num_pts, n_step_vars)
+                step_index = np.column_stack([np.full(num_pts, val) for val in step_val])
             else:
-                # Single step variable
-                step_index = np.full_like(freq_index, step_val)
-            step_index = step_index[:, None]  # Ensure step_index is 2D
-            stacked = np.hstack((step_index, freq_index[:, None], vna_arr))
+                # 2D column (num_pts, 1)
+                step_index = np.full((num_pts, 1), step_val)
+
+            # Ensure vna_arr is 2D with num_pts rows
+            vna_arr = np.asarray(vna_arr)
+            if vna_arr.ndim == 1:
+                vna_arr = vna_arr.reshape(-1, 1)
+            elif vna_arr.shape[0] != num_pts and vna_arr.shape[1] == num_pts:
+                # If it came transposed, fix it
+                vna_arr = vna_arr.T
+            assert vna_arr.shape[0] == num_pts, f"vna_arr.rows={vna_arr.shape[0]} != num_pts={num_pts}"
+
+            # Now safely hstack
+            stacked = np.hstack((step_index, freq_index.reshape(-1, 1), vna_arr))
+
             # Turn off the VNA power
             if hasattr(vna, "set_output"):
                 vna.set_output(False)
             return stacked.tolist()
+        
         # Sweeping one parameter (power, delay, etc.)
         val0, instr, task, units = sweep_controls[sweep_var]
         for val in tqdm(sweep_list, desc=f'Sweeping {sweep_var}', leave=False):
             apply_control(instr, task, val)
 
-            self.vna_meas_wait(vna)
-            # Pull the VNA data from the read_dict
-            vna_arr_raw = self.pull_vna_data(read_dict)
-            vna_arr = format_router.reshape_data(vna_arr_raw, vna)
-            freq_pts = vna.get_fpoints(vna)
-            freq_index = freq_pts[:,None] # Ensure freq_index is 2D
-            sweep_index = np.full((len(freq_pts), 1), val) 
+            # Deterministic acquisition (choose averaging policy as above)
+            freq_index, vna_arr = self._acquire_vna_trace_once(
+                vna,
+                read_dict=read_dict,
+                format_router=format_router,
+                channel=1,
+                use_averaging=None,  # 1 for single-sweep per value; N for forced averaging
+            )
+
+            freq_index = freq_index[:,None] # Ensure freq_index is 2D
+            sweep_index = np.full((len(freq_index), 1), val) 
             stacked = np.hstack((freq_index, sweep_index, vna_arr))
             sweep_data.extend(stacked.tolist())
+
         # Turn off the VNA power    
         if hasattr(vna, "set_output"):
             vna.set_output(False)
@@ -1266,8 +1801,12 @@ class exp3():
         sweep_controls, 
         select_read,
         sweep_order,
-        step_val=0
+        step_val=0,
+        hold_time=None
         ):
+        # If the experiment isn't to be slowed down, use the time constant
+        if hold_time is None:
+            hold_time = {var: self.tconst for var in sweep_order}
         # All of the data from the sweep will be stored in this list
         sweep_data = []
         # Check if the 'volt_list' dictionary contains the required variables
@@ -1297,14 +1836,15 @@ class exp3():
                 val0, instr, task, ramp_func, units = sweep_controls[var]
                 # Call the method or attribute on the instrument
                 apply_control(instr, task, val)
-            # Sleep to allow the instruments/setup to settle
-            sleep(self.tconst)
-            # Pull the lock-in (LF) data from the select_read
-            lf_values = self.pull_lockin_data(select_read, target_labels=['Vlfx', 'Vlfy'])
+            # Determine max hold time across all variables for this step
+            max_hold = max(hold_time.get(var, self.tconst) for var in sweep_order)
+            sleep(max_hold)
+            # Pull the lock-in (HF) data from the select_read
+            hf_values = self.pull_lockin_data(select_read, target_labels=['Vhfx', 'Vhfy'])
             # Normalize step_value: tuple → unpacked list; scalar → wrap as list
             step_tag = list(step_val) if isinstance(step_val, tuple) else [step_val]
             # Append the voltage and lock-in values to the sweep_data list
-            sweep_data.append(step_tag + list(volts) + lf_values)
+            sweep_data.append(step_tag + list(volts) + hf_values)
         return sweep_data
 
 
@@ -1321,7 +1861,8 @@ class exp3():
         *,
         step_order: list,       # Order-dependent list of step variable name
         sweep_order: list,      # Order-dependent list of sweep variable name
-        format_router=None
+        format_router=None,
+        hold_time=None
         ):     
         # Create an empty list for the sweep data
         sweep_data = []
@@ -1351,6 +1892,11 @@ class exp3():
                     *sweep_args,
                     step_val=step_vals[0] if len(step_vals) == 1 else step_vals,
                     format_router=format_router)
+            elif hold_time is not None:
+                out_data = sweep_func(
+                    *sweep_args,
+                    step_val=step_vals[0] if len(step_vals) == 1 else step_vals,
+                    hold_time=hold_time) 
             else:
                 out_data = sweep_func(
                     *sweep_args,
@@ -1369,7 +1915,7 @@ class exp3():
     #######################################################################################
 
     def run_experiment(self, exp_name = 'sweep_NA', savedata = False,
-                       format_tag = 'MLOG', **kwargs):
+                       format_tag = 'MLOG', return_data = False, **kwargs):
 
         # Import definitions from the 'init_reads'
         (
@@ -1395,7 +1941,7 @@ class exp3():
         step_order = list(self.__step['variable'])
         # Specify the lock-in read dictionaries being used
         if sweep_type == 'transport':
-            select_read = {key: read_dict[key] for key in ['Vlfx', 'Vlfy']}
+            select_read = {key: read_dict[key] for key in ['Vhfx', 'Vhfy']}
 
         # Assign the sweep lists to their variables and then package as a dictionary
         sweep_map = dict(zip(self.__sweep['variable'], self.__sweep['sweep lists']))
@@ -1432,7 +1978,8 @@ class exp3():
                     volt_lists=sweep_map,
                     sweep_controls=sweep_controls,
                     select_read=select_read,
-                    sweep_order=sweep_order)
+                    sweep_order=sweep_order,
+                    hold_time=kwargs.get('hold_time'))
             
 
         ###################################################################################
@@ -1505,7 +2052,8 @@ class exp3():
                     sweep_func=self.run_transport_sweep,
                     sweep_args=[sweep_map, sweep_controls, select_read, sweep_order],
                     step_order=step_order,
-                    sweep_order=sweep_order)
+                    sweep_order=sweep_order,
+                    hold_time=kwargs.get('hold_time'))
  
 
         # If Unimplemented Step-Sweep is Called ----------------------------------------- #
@@ -1549,9 +2097,12 @@ class exp3():
         # Construct the full column list
         columns = step_order + sweep_order + columns_with_units
 
+        # If it's a 1D sweep and sweep_data has an extra leading column, strip it
+        if step_type is None and len(sweep_data[0]) == len(columns) + 1:
+            sweep_data = [row[1:] for row in sweep_data]
+
         # Check that the sweep_data is a list of lists and that each row has the same
         # length as columns.
-
         for i, row in enumerate(sweep_data):
             if len(row) != len(columns):
                 print(f"Row {i}: expected {len(columns)} cols, got {len(row)} → {row}")
@@ -1564,13 +2115,197 @@ class exp3():
 
         # If savedata is True, create a SQLite database and insert the data
         if savedata:
-            # Create the database 
-            sqldb = self.create_sqldb(exp_name, columns)
-            # Save the sweep_data to the database 
-            write_to_database(sqldb, sweep_data, step_indices)
-            # End the connection to the database
-            self.close_sqldb(sqldb)
+            # Create the database file path
+            filepath = create_path_filename(exp_name)
+            # Build the schema dynamically from the experiment class
+            schema = self.build_meas_schema(columns)
+            # Create the database
+            db = generalDB(filepath, schema)
+
+            # Insert sweep data
+            sweep_lists = self.__sweep.get('sweep lists')
+            sweep_rows = [tuple(sweep_lists[j][i] for j in range(len(sweep_lists)))
+                        for i in range(len(sweep_lists[0]))]
+            db.insert_many('table_sweep', sweep_rows)
+
+            # Insert step data (if any)
+            step_lists = self.__step.get('step lists')
+            if step_lists:
+                step_rows = [tuple(step_lists[j][i] for j in range(len(step_lists)))
+                            for i in range(len(step_lists[0]))]
+                db.insert_many('table_step', step_rows)
+
+            # Insert measurement data
+            write_to_database(db, sweep_data, step_indices)
+
+            # Insert metadata in flat format
+            meta_rows = [('experiment', key, str(value)) for key, value in self.get_ClassAttributes()]
+            db.insert_many('metadata', meta_rows)
+
+            # Close the database
+            db.close()
             print('Data saved to database')
         else:
             print('Data collected but not saved to database')
+        if return_data == True:
+            return sweep_lists, step_lists, sweep_data
         return
+    
+
+###########################################################################################
+## Data Saving Class ------------------------------------------------------------------- ##
+###########################################################################################  
+
+class DataSaver:
+    def __init__(self, base_path="data"):
+        self.base_path = base_path
+
+    def save_to_db(self, exp_name, columns, sweep_data, sweep_lists=None, 
+                   step_lists=None, metadata=None, scheme=None, overwrite=False):
+        # Create file path
+        filepath = create_path_filename(exp_name, overwrite=overwrite)
+
+        # Build schema dynamically
+        schema = self._build_schema(columns, scheme=scheme)
+
+        # Create DB
+        db = generalDB(filepath, schema)
+
+        # Insert sweep data
+        if sweep_lists:
+            sweep_rows = [tuple(sweep_lists[j][i] for j in range(len(sweep_lists)))
+                          for i in range(len(sweep_lists[0]))]
+            db.insert_many('table_sweep', sweep_rows)
+
+        # Insert step data
+        if step_lists:
+            step_rows = [tuple(step_lists[j][i] for j in range(len(step_lists)))
+                         for i in range(len(step_lists[0]))]
+            db.insert_many('table_step', step_rows)
+
+        # Insert measurement data
+        db.insert_many('table_measurements', sweep_data)
+
+        # Insert metadata
+        if metadata:
+            meta_rows = [('experiment', key, str(value)) for key, value in metadata.items()]
+            db.insert_many('metadata', meta_rows)
+
+        db.close()
+        print(f"Data saved to {filepath}")
+        return filepath
+
+    # Load data from database
+    def load_table_meas(self, filepath):
+        conn = sqlite3.connect(filepath)
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM table_measurements")
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+
+    def _build_schema(self, columns, scheme=None):
+        if scheme is None:
+            params = columns
+            types = ['REAL' for _ in columns]  # Default all REAL
+        elif scheme == 'dpg':
+            params = columns
+            types = [
+                'REAL' if col in ['ElapsedSeconds', 'Pressure1', 'Pressure2'] else 'TEXT'
+                for col in columns
+            ]
+        else:
+            raise ValueError(f"Select None or 'dpg' for scheme. Got: {scheme}")
+
+        schema = {
+            'table_measurements': {
+                'params': params,
+                'types': types
+            },
+            'table_sweep': {'params': [], 'types': []},
+            'table_step': {'params': [], 'types': []},
+            'metadata': {
+                'params': ['category', 'key', 'value'],
+                'types': ['TEXT', 'TEXT', 'TEXT']
+            }
+        }
+        return schema
+
+
+###########################################################################################
+## VNA class --------------------------------------------------------------------------- ##
+###########################################################################################  
+
+class VNALogger:
+    def __init__(self, vna, dpg, datasaver, exp_name, columns, save_interval=300,
+                 overwrite=False):
+        # Initialize instruments
+        self.vna = vna
+        self.dpg = dpg
+        # Initialize parameters
+        self.datasaver = datasaver
+        self.exp_name = exp_name
+        self.columns = columns
+        self.save_interval = save_interval
+        self.data = []
+        self.stop_flag = False
+        self.start_time = None
+        self.last_save_time = None
+        self.loop_counter = 0
+        self.filepath = None
+        self.overwrite = overwrite 
+
+    # Wait for user input to stop recording
+    def wait_for_stop(self):
+        input("Press Enter to stop...\n")
+        self.stop_flag = True
+
+    # Start recording data
+    def vna_log(self, wait_time=10, record_pressure=True):
+        self.start_time = time.time()
+        self.last_save_time = time.time()
+        threading.Thread(target=self.wait_for_stop, daemon=True).start()
+        print("Recording started...")
+
+        while not self.stop_flag:
+            # Measure VNA data
+            time.sleep(wait_time)
+            complex_data = self.vna.read_complex(channel=1)
+            real_part = np.real(complex_data)
+            imag_part = np.imag(complex_data)
+            fpts = self.vna.get_fpoints()
+
+            if record_pressure:
+                # Measure pressures
+                pressure1 = self.dpg.measure('Pressure1')
+                pressure2 = self.dpg.measure('Pressure2')
+            else:
+                pressure1 = None
+                pressure2 = None
+
+            timestamp = time.time()
+            elapsed = round(timestamp - self.start_time, 2)
+            timestamp_str = pd.to_datetime(timestamp, unit='s').strftime('%Y-%m-%d %H:%M:%S')
+
+            # Append sweep rows
+            sweep_rows = [
+                (elapsed, timestamp_str, pressure1, pressure2, float(f), float(r), float(i))
+                for f, r, i in zip(fpts, real_part, imag_part)
+            ]
+            self.data.extend(sweep_rows)
+
+            # Periodic save
+            if time.time() - self.last_save_time >= self.save_interval:
+                print("Saving data to database:", len(self.data), "records")
+                self.filepath = self.datasaver.save_to_db(
+                    self.exp_name, self.columns, self.data,
+                    scheme='dpg', overwrite=self.overwrite)
+
+                self.last_save_time = time.time()
+
+        # Final save
+        print("Final save...")
+        self.filepath = self.datasaver.save_to_db(
+            self.exp_name, self.columns, self.data,
+            scheme='dpg', overwrite=self.overwrite)
+        print("Recording stopped.")
