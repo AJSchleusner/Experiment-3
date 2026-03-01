@@ -29,8 +29,9 @@ import pandas as pd
 import os
 import re
 import math
+import warnings
+import textwrap
 
-from typing import Tuple, Literal
 from datetime import date
 from newinstruments.BlueFors import BlueFors
 import matplotlib.pyplot as plt
@@ -42,9 +43,9 @@ import matplotlib.cm as cm
 from matplotlib.cm import ScalarMappable
 import matplotlib.colors as mcolors
 from functools import partial
-from scipy.optimize import curve_fit
 from pathlib import Path
-import textwrap
+from typing import Optional, Sequence, Tuple, Literal
+from scipy.optimize import curve_fit, OptimizeWarning
 
 
 ###########################################################################################
@@ -1023,6 +1024,16 @@ def get_fit_model(fit_type):
             'func': gaussian,
             'guess': lambda x, y: [max(y) - min(y), x[np.argmax(y)], (max(x) - min(x)) / 10, min(y)],
             'params': ['amplitude', 'center', 'width', 'offset']
+        },
+        'sqroot': {
+            'func': lambda x, a, b: a * np.sqrt(x) + b,
+            'guess': lambda x, y: [np.polyfit(np.sqrt(x), y, 1)[0], np.polyfit(np.sqrt(x), y, 1)[1]],
+            'params': ['a', 'b']
+        },
+        'exponential': {
+            'func': lambda x, a, b: a * np.exp(b * x),
+            'guess': lambda x, y: [max(y), 0],
+            'params': ['a', 'b']
         }
     }
     if fit_type not in models:
@@ -1034,14 +1045,19 @@ model_help = {
     'linear': 'linear(x, m, b): m = slope, b = intercept',
     'lorentzian': 'lorentzian(x, A, x0, w, y0): A = amplitude, x0 = center, w = width, y0 = offset',
     'lorz_inv': 'lorz_inv(x, A, x0, w, y0): inverse form of Lorentzian',
-    'gaussian': 'gaussian(x, A, x0, w, y0): standard Gaussian model'
+    'gaussian': 'gaussian(x, A, x0, w, y0): standard Gaussian model',
+    'sqroot': 'sqroot(x, a, b): a * sqrt(x) + b',
+    'exponential': 'exponential(x, a, b): a * exp(b * x)'
 }
 def print_model_help():
     print("📘 Fit Models Reference:")
     for name, desc in model_help.items():
         print(f"- {name}: {desc}")
 
-# Fit data using curve_fit from scipy.optimize
+
+
+
+'''# Fit data using curve_fit from scipy.optimize
 def fit_data(x, y, fit_type, artifact_indices=None, user_guess=None):
     if artifact_indices:
         x_new, y_new = exclude_artifacts(x, y, artifact_indices)
@@ -1059,7 +1075,122 @@ def fit_data(x, y, fit_type, artifact_indices=None, user_guess=None):
         p0 = guess_func(x_new, y_new)
     # Perform the curve fitting
     popt, pcov = curve_fit(model_func, x_new, y_new, p0=p0)
+    return popt, pcov, model_func'''
+
+
+
+
+def fit_data(
+    x: np.ndarray,
+    y: np.ndarray,
+    fit_type: str,
+    artifact_indices: Optional[Sequence[int]] = None,
+    user_guess: Optional[Sequence[float]] = None,
+    maxfev: Optional[int] = None,
+    quiet: bool = True,
+    **curve_fit_kwargs
+) -> Tuple[np.ndarray, np.ndarray, callable]:
+    """
+    Fit data using scipy.optimize.curve_fit with robust failure handling.
+
+    Parameters
+    ----------
+    x : array-like
+        1D x-data.
+    y : array-like
+        1D y-data (same length as x).
+    fit_type : str
+        A key understood by get_fit_model(fit_type) to return (model_func, guess_func, param_names).
+    artifact_indices : sequence of int, optional
+        Indices to exclude from the fit (e.g., bad points).
+    user_guess : sequence of float, optional
+        User-provided initial parameter guess. Length must match len(param_names).
+    maxfev : int, optional
+        Maximum number of function evaluations for curve_fit.
+        If None, scipy's default is used. Pass a higher number (e.g., 5000-20000) for hard fits.
+    **curve_fit_kwargs
+        Any additional keyword arguments forwarded to curve_fit (e.g., bounds, method, sigma, absolute_sigma).
+
+    Returns
+    -------
+    popt : ndarray
+        Optimal parameters. If fitting fails, this will be a zero vector of length len(param_names).
+    pcov : ndarray
+        Estimated covariance of popt. If fitting fails, this will be a matrix of NaNs with shape (n_params, n_params).
+    model_func : callable
+        The model function that maps (x, *params) -> y.
+    """
+    # Optionally ignore harmless OptimizeWarning (e.g., covariance could not be estimated)
+    warnings.filterwarnings("ignore", category=OptimizeWarning)
+    warning_count = 0
+
+    # Optionally exclude artifacts
+    if artifact_indices:
+        x_new, y_new = exclude_artifacts(x, y, artifact_indices)
+    else:
+        x_new, y_new = x, y
+
+    # Extract the model function, guess function, and parameter names
+    model_func, guess_func, param_names = get_fit_model(fit_type)
+    n_params = len(param_names)
+
+    # Validate and prepare initial guess
+    if user_guess is not None:
+        if len(user_guess) != n_params:
+            raise ValueError(
+                f"Incorrect guess length for '{fit_type}'. "
+                f"Expected {n_params} parameters: {param_names}"
+            )
+        p0 = np.asarray(user_guess, dtype=float)
+    else:
+        p0 = np.asarray(guess_func(x_new, y_new), dtype=float)
+        if len(p0) != n_params:
+            raise ValueError(
+                f"Guess function for '{fit_type}' returned {len(p0)} params, "
+                f"but expected {n_params}: {param_names}"
+            )
+
+    # Prepare fallbacks in case the fit fails
+    popt_fallback = np.zeros(n_params, dtype=float)
+    pcov_fallback = np.full((n_params, n_params), np.nan, dtype=float)
+
+    # Pass maxfev through if provided, without overwriting explicit user kwarg
+    if maxfev is not None and "maxfev" not in curve_fit_kwargs:
+        curve_fit_kwargs["maxfev"] = maxfev
+
+    # Do the fit with robust error handling
+    try:
+        popt, pcov = curve_fit(
+            model_func,
+            np.asarray(x_new, dtype=float),
+            np.asarray(y_new, dtype=float),
+            p0=p0,
+            **curve_fit_kwargs
+        )
+    except RuntimeError as e:
+        warning_count += 1
+        if not quiet:
+            print(f"[fit_data warning] Fit failed for '{fit_type}': {e}. Returning zeros for parameters.")
+        return popt_fallback, pcov_fallback, model_func
+    except Exception as e:
+        warning_count += 1
+        if not quiet:
+            print(f"[fit_data warning] Fit errored for '{fit_type}': {e}. Returning zeros for parameters.")
+        return popt_fallback, pcov_fallback, model_func
+    if warning_count > 0 and not quiet:
+        print(f"[fit_data warning] Total warnings during fit: {warning_count}. Check data quality or initial guess.")
+
     return popt, pcov, model_func
+
+
+
+
+
+
+
+
+
+
 
 # Find quality factors using the inverse lorentzian
 def quality_fits(freq, power, data, artifact_indices=None, user_guess=None,

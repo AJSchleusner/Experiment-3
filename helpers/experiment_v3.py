@@ -879,29 +879,24 @@ class exp3():
         self.__registry['yoko_rgt'].ramp_to_voltage( Vch, duration=1)
         self.__registry['yoko_mgt'].ramp_to_voltage( Vch, duration=1)
         self.__registry['yoko_rch'].ramp_to_voltage( Vch, duration=1)
-        # Empty reservoirs
+        # Empty device
         self.__registry['yoko_res'].enable_source()
         self.__registry['yoko_res'].ramp_to_voltage(-0.8, duration=1)
+        self.__registry['yoko_rch'].ramp_to_voltage(-0.8, duration=1)
+        self.__registry['yoko_mgt'].ramp_to_voltage(-0.8, duration=1)
+        self.__registry['yoko_rgt'].ramp_to_voltage(-0.8, duration=1)
         sleep(5)
-        # Ramp reservoir voltage
+        # Ramp to deposition voltages
         self.__registry['yoko_res'].ramp_to_voltage(Vres, duration=1)
-        sleep(1)
-
-    # Prepare electrodes for a transport sweep
-    def transport_prep(self, Vch=0.0, Vres=0.7, Vgt=-0.4, Vpn =-0.2) -> None:
-        # Ramp electrode voltages
-        self.__registry['yoko_pin'].ramp_to_voltage( Vpn, duration=1)
-        self.__registry['yoko_res'].ramp_to_voltage(Vres, duration=1)
-        self.__registry['yoko_lgd'].ramp_to_voltage( Vgt, duration=1)
-        self.__registry['yoko_rgt'].ramp_to_voltage( Vch, duration=1)
-        self.__registry['yoko_mgt'].ramp_to_voltage( Vch, duration=1)
         self.__registry['yoko_rch'].ramp_to_voltage( Vch, duration=1)
-        sleep(2)
+        self.__registry['yoko_mgt'].ramp_to_voltage( Vch, duration=1)
+        self.__registry['yoko_rgt'].ramp_to_voltage( Vch, duration=1)
 
-    def deposit_electrons(self) -> tuple:
+
+    def deposit_electrons(self, delay=0.3) -> tuple:
         self.__registry['gen_fila'].output = 'on'
         print('filament turned on')
-        sleep(0.3)
+        sleep(delay)
         self.__registry['gen_fila'].trigger()
         print('scan started')
         output = self.__registry['daq'].scan()
@@ -991,6 +986,7 @@ class exp3():
         verbose: bool = False,                              # show small status in tqdm postfix
         quiet_trigger: bool = True,                         # suppress prints inside trigger_fn
         default_Vres: float = 1.0,                          # used if prep_fn is None and Vres not swept
+        fire_delay: float = 0.3,
         ):
 
         """
@@ -1003,7 +999,7 @@ class exp3():
         if trigger_fn is None:
             if not hasattr(self, "deposit_electrons"):
                 raise ValueError("No trigger_fn provided and expr has no deposit_electrons().")
-            trigger_fn = self.deposit_electrons
+            trigger_fn = self.deposit_electrons(delay=fire_delay)
 
         # Prepare sweep axes
         axes_order  = list(sweep_axes.keys())
@@ -1309,38 +1305,36 @@ class exp3():
     def vna_wait_time(self, vna=None):
         if vna is None:
             vna = self.__vna['instrument']
-        # Check if the vna is averaging (True) or not (False)
-        vna_avg = vna.get_average_state()
-        # Check how many averages are being taken by the vna
-        vna_num_avgs = vna.get_averages()
-        # If no averaging is occurring...
-        if not vna_avg:
-            # ... set the sleep time to the sweep time of the vna
-            vsleep  = vna.get_sweep_time(channel = 1)
-            avstate = False
-        # If averaging is occurring...
-        elif vna_avg:
-            # ... set the sleep time to the sweep time multiplied by the number of averages
-            vsleep  = vna.get_sweep_time(channel = 1) * vna_num_avgs
-            avstate = True
-        # Automatically scale the VNA y axis 
-        vna.auto_scale(channel = 1)
-        return avstate, vsleep
-    
-    # Prepare the VNA for measurement by setting the averaging state and waiting for the
-    # sweep to complete. 
-    def vna_meas_wait(self,vna=None):
+
+        # Query averaging configuration
+        avg_enabled = vna.get_average_state()
+        N = vna.get_averages()
+
+        # Sweep time per sweep (not per average!)
+        sweep_time = vna.get_sweep_time(channel=1)
+
+        # For continuous averaging, total time = N sweeps
+        wait_time = sweep_time * (N if avg_enabled else 1)
+
+        return avg_enabled, wait_time
+
+
+    def vna_meas_wait(self, vna=None):
         if vna is None:
             vna = self.__vna['instrument']
-        avs, vsleep = self.vna_wait_time(vna)
-        # Toggle the average state of the VNA to ensure it is ready for the next
-        # sweep.
-        vna.set_average_state(not avs)
-        vna.set_average_state(avs)
-        # Let the VNA collect data for the length of time necessary for a full sweep
-        # (with possible averaging). The factor of 1.05 is just a safety factor to ensure
-        # the VNA has enough time to collect the data we specifically want. 
-        sleep(1.05*vsleep)
+
+        avg_enabled, wait_time = self.vna_wait_time(vna)
+
+        if avg_enabled:
+            # IMPORTANT: reset averaging accumulator once, not by toggling average ON/OFF
+            try:
+                vna.clear_averages(channel=1)
+            except AttributeError:
+                pass
+
+        # Give the VNA enough time to collect N sweeps
+        sleep(1.05 * wait_time)
+
 
     # This function pulls the VNA data from the read_dict and returns it as a list.
     def pull_vna_data(self, read_dict):
@@ -1358,17 +1352,10 @@ class exp3():
 
     # This function performs a single acquisition from the VNA with optional
     # frequency range and number of points settings.
-    def _acquire_vna_trace_once(self, vna: N5230A, *, read_dict, format_router,
+    def _acquire_vna_trace_once(self, vna, *, read_dict, format_router,
                                 start=None, stop=None, num_pts=None,
                                 channel=1, use_averaging=None):
-        """
-        Deterministic single acquisition:
-        - If use_averaging is an int > 1, do an averaged sweep (one trigger runs all N sweeps).
-        - If None or 1, do exactly one sweep.
-        Configures optional start/stop/points if provided, then triggers and waits.
-        Returns: (freq[:,1], vna_arr[:,k]) with k depending on your format_router (e.g., 2 for Re/Im)
-        """
-
+        
         # Optional frequency plan
         if (start is not None) and (stop is not None):
             vna.set_frequency_range(start, stop, channel=channel)
@@ -1379,77 +1366,69 @@ class exp3():
         if hasattr(vna, "set_output"):
             vna.set_output(True)
 
-        # Hold (no continuous)
-        if hasattr(vna, "set_trigger_continuous"):
-            vna.set_trigger_continuous(False)  # :INIT:CONT OFF
-
-        # Averaging behavior
+        # ---- Decide averaging policy -------------------------------------------
         if use_averaging is None:
-            # honor current average state/count, but run deterministically
-            avg_count = vna.get_averages(channel=channel)
-            avg_on = vna.get_average_state(channel=channel) and (avg_count > 1)
+            # Honor instrument state
+            avg_count = int(vna.get_averages(channel=channel))
+            avg_on = bool(vna.get_average_state(channel=channel)) and (avg_count > 1)
         else:
-            # force what the caller requested
-            if int(use_averaging) > 1:
-                vna.set_averages(int(use_averaging), channel=channel)
+            avg_count = max(1, int(use_averaging))
+            if avg_count > 1:
+                vna.set_averages(avg_count, channel=channel)
                 vna.set_average_state(True, channel=channel)
                 avg_on = True
-                avg_count = int(use_averaging)
             else:
                 vna.set_average_state(False, channel=channel)
                 vna.set_averages(1, channel=channel)
                 avg_on = False
-                avg_count = 1
 
-        # Clear previous averaging accumulation
-        if hasattr(vna, "clear_averages"):
-            vna.clear_averages(channel=channel)
-
-        # If averaging is ON, let a single trigger complete the entire average
-        if hasattr(vna, "set_trigger_average_mode"):
-            vna.set_trigger_average_mode(avg_on)  # :TRIG:AVER ON/OFF
-
-        # One trigger starts either one sweep (avg OFF) or N-sweep average (avg ON)
-        vna.trigger_single(channel=channel)
-
-        # Wait for completion deterministically
+        # ---- Continuous-averaging pathway (your device) -------------------------
         if avg_on:
-            # Wait until averaging complete bit flips (STAT:OPER:AVER?)
-            # (averaging_complete returns True when done)
-            while not vna.averaging_complete(channel=channel):
-                time.sleep(0.05)
-            # As a final fence, OPC ensures everything has settled
-            vna.get_operation_completion()
-        else:
-            # One sweep: just wait OPC
-            vna.get_operation_completion()
+            # Stay in continuous sweep
+            if hasattr(vna, "set_trigger_continuous"):
+                vna.set_trigger_continuous(True)  # :INIT:CONT ON
 
-        # Pull vector data using your existing router+read path
+            # Clear the averaging accumulator once
+            if hasattr(vna, "restart_averaging"):
+                vna.restart_averaging(channel=channel)
+            elif hasattr(vna, "clear_averages"):
+                vna.clear_averages(channel=channel)
+
+            # Sleep long enough for N sweeps to complete
+            sweep_time = float(vna.get_sweep_time(channel=channel))
+            time.sleep(1.05 * avg_count * sweep_time)
+
+        else:
+            # ---- One-sweep deterministic path ----------------------------------
+            if hasattr(vna, "set_trigger_continuous"):
+                vna.set_trigger_continuous(False)  # :INIT:CONT OFF
+
+            # Trigger one sweep and wait OPC
+            vna.trigger_single(channel=channel)
+            if hasattr(vna, "get_operation_completion"):
+                vna.get_operation_completion()
+            else:
+                # Fallback wait
+                sweep_time = float(vna.get_sweep_time(channel=channel))
+                time.sleep(1.05 * sweep_time)
+
+        # ---- Read trace and frequency axis -------------------------------------
         vna_arr_raw = self.pull_vna_data(read_dict)
         vna_arr = format_router.reshape_data(vna_arr_raw, vna)
 
-        # Frequency axis: prefer driver method if you have it; else compute from start/stop/points
         if hasattr(vna, "get_fpoints"):
-            try:
-                freq_pts = vna.get_fpoints()  # prefer bound call if available
-                freq_index = np.asarray(freq_pts).reshape(-1, 1)
-            except TypeError:
-                # some drivers require channel or self passed; fallback
-                freq_pts = vna.get_fpoints(vna)
-                freq_index = np.asarray(freq_pts).reshape(-1, 1)
+            freq_pts = vna.get_fpoints()
+            freq_index = np.asarray(freq_pts).reshape(-1, 1)
         else:
             if (start is None) or (stop is None):
-                # fall back to channel start/stop getters
                 start = vna.get_start_frequency(channel=channel)
-                stop = vna.get_stop_frequency(channel=channel)
+                stop  = vna.get_stop_frequency(channel=channel)
             if num_pts is None:
-                if hasattr(vna, "get_sweep_points"):
-                    num_pts = vna.get_sweep_points(channel=channel)
-                else:
-                    raise RuntimeError("No get_fpoints/get_sweep_points available to build frequency axis.")
+                num_pts = vna.get_sweep_points(channel=channel)
             freq_index = np.linspace(start, stop, int(num_pts), endpoint=True)[:, None]
 
         return freq_index, vna_arr
+
 
 
     #######################################################################################
@@ -1457,23 +1436,85 @@ class exp3():
     #######################################################################################
 
     # This function pulls data from the sr830 (LF) or sr844 (HF) and returns it as a list.
-    def pull_lockin_data(self, read_dict, target_labels):
-        # Create an empty list to store the lockin data
-        lockin_arr = []
-        # Loop through all read_dict items
-        for label in target_labels:
-            instr, method, units = read_dict[label]
-            # Call the method on the instrument to get the data
-            value = getattr(instr, method)
-            # If the value is callable, call it to get the data
-            data = value() if callable(value) else value
-            # Append the data to the lockin_arr list
+    def pull_lockin_data(self, read_dict, target_labels, avg_period=None,
+                         n_samples=None, sample_interval=0.01):
+
+        # Helper: convert a scalar/tuple/list to a list of numbers
+        def _to_list(data):
             if isinstance(data, (tuple, list)):
-                lockin_arr.extend(data)
+                return list(data)
+            return [data]
+
+        # Single-shot measurement
+        if not avg_period and not n_samples:
+            lockin_arr = []
+            for label in target_labels:
+                instr, method, units = read_dict[label]
+                value = getattr(instr, method)
+                data = value() if callable(value) else value
+                lockin_arr.extend(_to_list(data))
+            return lockin_arr
+
+        # Determine stopping condition
+        use_time  = bool(avg_period and avg_period > 0)
+        use_count = bool(n_samples and n_samples > 0)
+        if not (use_time or use_count):
+            # Fallback to single-shot if both are invalid (<=0)
+            print("Warning: No lock-in averaging conducted.")
+            return self.pull_lockin_data(read_dict, target_labels)
+
+        # Accumulators
+        sums_by_label = {}   # label -> list[float]
+        counts = 0
+        lengths = {}         # label -> expected vector length
+
+        start = time.monotonic()
+        while True:
+            # Read once from all target labels (keeps samples aligned in time)
+            for label in target_labels:
+                instr, method, units = read_dict[label]
+                value = getattr(instr, method)
+                data = value() if callable(value) else value
+                vec = _to_list(data)
+
+                # Initialize accumulators with correct length on first read
+                if label not in sums_by_label:
+                    sums_by_label[label] = [0.0] * len(vec)
+                    lengths[label] = len(vec)
+                else:
+                    # Sanity check for consistent vector length across reads
+                    if len(vec) != lengths[label]:
+                        raise ValueError(
+                            f"Inconsistent data length for '{label}': "
+                            f"expected {lengths[label]}, got {len(vec)}"
+                        )
+
+                # Element-wise accumulate
+                for i, v in enumerate(vec):
+                    sums_by_label[label][i] += float(v)
+
+            counts += 1
+
+            # Check stopping criteria
+            done_time = use_time and ((time.monotonic() - start) >= avg_period)
+            done_count = use_count and (counts >= n_samples)
+            if done_time or done_count:
+                break
+
+            # Slow down sampling, like a coward
+            if sample_interval and sample_interval > 0:
+                time.sleep(sample_interval)
             else:
-                lockin_arr.append(data)
-        # Return both the x and y data from the selected lock-in amplifier
-        return lockin_arr
+                # Yield to scheduler at least a tiny bit
+                time.sleep(0)
+
+        # Compute means and flatten in the requested label order
+        means = []
+        for label in target_labels:
+            means.extend([s / counts for s in sums_by_label[label]])
+
+        return means
+
 
 
     #######################################################################################
@@ -1726,11 +1767,13 @@ class exp3():
             # S2 will be the stop frequency
             stop_freq = sweep_list[-1]
 
-            # Choose: one sweep or averaged result
-            #   - One sweep per step: use_averaging=1
-            #   - Honor current settings: use_averaging=None
-            #   - Force N-sweep average: use_averaging=N
+            # Pull current N (or set your own N here)
+            try:
+                N = max(1, int(vna.get_averages(channel=1)))
+            except Exception:
+                N = 1
 
+            # Force the call to actually average, not “one sweep”
             freq_index, vna_arr = self._acquire_vna_trace_once(
                 vna,
                 read_dict=read_dict,
@@ -1739,7 +1782,9 @@ class exp3():
                 stop=stop_freq,
                 num_pts=num_pts,
                 channel=1,
-                use_averaging=None)   # or 1 for exactly one sweep, or an int N
+                use_averaging=N  # explicitly ask for N-sweep average
+            )
+
 
             # Build step index column(s)
             if isinstance(step_val, (list, tuple)):
@@ -1802,33 +1847,45 @@ class exp3():
         select_read,
         sweep_order,
         step_val=0,
-        hold_time=None
+        hold_time=None,
+        avg_period=None,
+        n_avg_samples=None,
+        sample_interval=0.01 # seconds between pulls in an averaging window
         ):
+
         # If the experiment isn't to be slowed down, use the time constant
         if hold_time is None:
             hold_time = {var: self.tconst for var in sweep_order}
+
         # All of the data from the sweep will be stored in this list
         sweep_data = []
+
         # Check if the 'volt_list' dictionary contains the required variables
         if set(volt_lists) != set(sweep_order):
             print(f"Problem: 'volt_lists' must contain the keys: {set(sweep_order)}")
             return
+        
         # Check if the 'sweep_controls' dictionary contains the required variables
         if set(sweep_controls) != set(sweep_order):
             print(f"Problem: 'sweep_controls' must only contain the keys: {set(sweep_order)}")
             return   
+        
         # Get the sweep voltage lists in the declared 'sweep_order' order
         sweep_lists = [volt_lists[var] for var in sweep_order]
+
         # Check if all voltage sweep lists are of equal length
         if not all(len(lst) == len(sweep_lists[0]) for lst in sweep_lists):
             print("Problem: All voltage sweep lists must be of equal length")
             return
+        
         # Ramp each variable to its initial value
         for var in sweep_order:
             val0, instr, task, ramp_func, units = sweep_controls[var]
-            getattr(instr, ramp_func)(volt_lists[var][0])    
+            getattr(instr, ramp_func)(volt_lists[var][0])  
+
         # Sleep for more than 2 second to allow the above ramping complete
         time.sleep(3)
+
         # Loop through the paired voltage values in the two lists
         for volts in tqdm(zip(*sweep_lists), desc=f'Sweeping {sweep_order}', leave=False):
             # Apply sweep controls to all sweep variables
@@ -1836,15 +1893,32 @@ class exp3():
                 val0, instr, task, ramp_func, units = sweep_controls[var]
                 # Call the method or attribute on the instrument
                 apply_control(instr, task, val)
+
             # Determine max hold time across all variables for this step
             max_hold = max(hold_time.get(var, self.tconst) for var in sweep_order)
             sleep(max_hold)
+
             # Pull the lock-in (HF) data from the select_read
-            hf_values = self.pull_lockin_data(select_read, target_labels=['Vhfx', 'Vhfy'])
+            hf_values = self.pull_lockin_data(
+                select_read, 
+                target_labels=['Vhfx', 'Vhfy'],
+                avg_period=avg_period,
+                n_samples=n_avg_samples,
+                sample_interval=sample_interval
+                )
+            
             # Normalize step_value: tuple → unpacked list; scalar → wrap as list
             step_tag = list(step_val) if isinstance(step_val, tuple) else [step_val]
+
             # Append the voltage and lock-in values to the sweep_data list
             sweep_data.append(step_tag + list(volts) + hf_values)
+
+        # Ramp back to initial voltages 
+        for var in sweep_order:
+            val0, instr, task, ramp_func, units = sweep_controls[var]
+            getattr(instr, ramp_func)(val0)
+        time.sleep(1)
+
         return sweep_data
 
 
@@ -1915,7 +1989,9 @@ class exp3():
     #######################################################################################
 
     def run_experiment(self, exp_name = 'sweep_NA', savedata = False,
-                       format_tag = 'MLOG', return_data = False, **kwargs):
+                       format_tag = 'MLOG', return_data = False,
+                       return_path = False,
+                       extra_metadata=None, **kwargs):
 
         # Import definitions from the 'init_reads'
         (
@@ -1979,7 +2055,11 @@ class exp3():
                     sweep_controls=sweep_controls,
                     select_read=select_read,
                     sweep_order=sweep_order,
-                    hold_time=kwargs.get('hold_time'))
+                    hold_time=kwargs.get('hold_time'),    
+                    avg_period=kwargs.get('avg_period'),          # seconds, optional
+                    n_avg_samples=kwargs.get('n_avg_samples'),    # integer, optional
+                    sample_interval=kwargs.get('sample_interval', 0.01)  # seconds
+                    )
             
 
         ###################################################################################
@@ -2053,7 +2133,11 @@ class exp3():
                     sweep_args=[sweep_map, sweep_controls, select_read, sweep_order],
                     step_order=step_order,
                     sweep_order=sweep_order,
-                    hold_time=kwargs.get('hold_time'))
+                    hold_time=kwargs.get('hold_time'),
+                    avg_period=kwargs.get('avg_period'),          # seconds, optional
+                    n_avg_samples=kwargs.get('n_avg_samples'),    # integer, optional
+                    sample_interval=kwargs.get('sample_interval', 0.01)  # seconds
+                    )
  
 
         # If Unimplemented Step-Sweep is Called ----------------------------------------- #
@@ -2113,9 +2197,11 @@ class exp3():
             for row in sweep_data
         ), "Problem: Mismatch in data and column lengths"
 
+        # Always include a filepath
+        filepath = None
         # If savedata is True, create a SQLite database and insert the data
         if savedata:
-            # Create the database file path
+            # Overwrite the None filepath
             filepath = create_path_filename(exp_name)
             # Build the schema dynamically from the experiment class
             schema = self.build_meas_schema(columns)
@@ -2140,6 +2226,16 @@ class exp3():
 
             # Insert metadata in flat format
             meta_rows = [('experiment', key, str(value)) for key, value in self.get_ClassAttributes()]
+
+            # Append extra rows provided by the notebook
+            if extra_metadata:
+                # extra_metadata can be dict[str, str] or list[tuple[str, str, str]]
+                if isinstance(extra_metadata, dict):
+                    meta_rows.extend([('notebook', k, str(v)) for k, v in extra_metadata.items()])
+                else:
+                    # assume list of (section, key, value)
+                    meta_rows.extend([(str(s), str(k), str(v)) for s, k, v in extra_metadata])
+
             db.insert_many('metadata', meta_rows)
 
             # Close the database
@@ -2147,9 +2243,16 @@ class exp3():
             print('Data saved to database')
         else:
             print('Data collected but not saved to database')
-        if return_data == True:
-            return sweep_lists, step_lists, sweep_data
-        return
+
+        # Prepare safe return values for return_data options
+        sweep_lists = sweep_lists if return_data else None
+        step_lists = step_lists if return_data else None
+        sweep_data = sweep_data if return_data else None
+        filepath = filepath if return_path else None
+
+        # Return the four output variables
+        return sweep_lists, step_lists, sweep_data, filepath
+
     
 
 ###########################################################################################
